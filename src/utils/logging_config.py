@@ -1,25 +1,26 @@
-"""Logging configuration for the application."""
+"""Logging configuration utilities."""
 import logging
 import sys
 from pathlib import Path
 
-def setup_logging():
-    """Configure logging for the application."""
-    # Create logs directory if it doesn't exist
-    log_dir = Path('logs')
-    log_dir.mkdir(exist_ok=True)
-    
-    # Configure logging
+def setup_logging(level=logging.INFO):
+    """Set up logging configuration."""
     logging.basicConfig(
-        level=logging.INFO,
+        level=level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(log_dir / 'pipeline.log')
+            logging.FileHandler("logs/pipeline.log"),
+            logging.StreamHandler(sys.stdout)
         ]
     )
     
-    # Suppress overly verbose logs from external libraries
-    logging.getLogger('matplotlib').setLevel(logging.WARNING)
-    logging.getLogger('pandas').setLevel(logging.WARNING)
-    logging.getLogger('PIL').setLevel(logging.WARNING)
+    # Create logs directory if it doesn't exist
+    Path("logs").mkdir(exist_ok=True)
+    
+    # Disable overly verbose logging from external libraries
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("matplotlib").setLevel(logging.WARNING)
+    logging.getLogger("pandas").setLevel(logging.WARNING)
+    
+    logger = logging.getLogger(__name__)
+    logger.info("Logging configured successfully")

@@ -146,8 +146,9 @@ hmm_analysis:
   # - 'tied': All states share same covariance matrix. Middle ground between diag and full.
   covariance_type: "diag"
   
-  n_iterations: 100  # Maximum EM algorithm iterations
-  random_state: 42    # For reproducibility
+  n_iterations: 2000  # Increased from 100 to improve convergence
+  n_init: 10         # Number of times to run fitting with different initializations
+  random_state: 42   # For reproducibility
   
   # Features used to detect market regimes
   features_to_use:
@@ -267,3 +268,53 @@ visualization:
 logging:
   level: "INFO"
   file: "pipeline.log"
+
+data:
+  raw_data_dir: "data/raw"
+  zip_file: "round-2-island-data-bottle.zip"
+
+feature_config:
+  technical_indicators:
+    enabled: true
+    rsi:
+      window: 14
+    macd:
+      fast: 12
+      slow: 26
+      signal: 9
+    bollinger:
+      window: 20
+      num_std: 2
+
+  regime_detection:
+    volatility:
+      enabled: true
+      window: 20
+      thresholds:
+        low_vol: 0.5
+        high_vol: 2.0
+    trend:
+      enabled: true
+      window: 50
+
+  signal_generation:
+    macd:
+      signal_cross_enabled: true
+      zero_cross_enabled: true
+    rsi:
+      enabled: true
+      oversold: 30
+      overbought: 70
+    ma_crossover:
+      enabled: true
+      fast_ma: 10
+      slow_ma: 30
+    volume_surge:
+      enabled: true
+      window: 20
+      threshold: 2.0
+
+output_config:
+  features_file: "outputs/trading_model/features.parquet"
+  visualization_dir: "outputs/web_dashboard"
+  llm_output_dir: "outputs/llm_insights"

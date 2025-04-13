@@ -1,131 +1,96 @@
-"""Data cleaning and validation module for the trading pipeline."""
+"""Data cleaning and validation module."""
 import logging
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional
+from typing import Optional, Dict
 
 logger = logging.getLogger(__name__)
 
-def validate_price_data(df: pd.DataFrame) -> List[str]:
-    """Validate price-related columns in the dataset.
+def validate_and_clean_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Validate and clean the input data."""
+    df = df.copy()
     
-    Args:
-        df: DataFrame containing trading data
-        
-    Returns:
-        List of validation issues found
-    """
-    issues = []
-    
-    # Check for negative prices
-    price_columns = df.filter(like='price').columns
-    for col in price_columns:
-        if (df[col] < 0).any():
-            issues.append(f"Negative values found in {col}")
-    
-    # Check for extreme price movements (z-score > 5)
-    for col in price_columns:
-        zscore = np.abs((df[col] - df[col].mean()) / df[col].std())
-        extreme_points = df[zscore > 5].index
-        if len(extreme_points) > 0:
-            issues.append(f"Extreme price movements found in {col} at: {extreme_points}")
-    
-    return issues
-
-def validate_volume_data(df: pd.DataFrame) -> List[str]:
-    """Validate volume-related columns in the dataset.
-    
-    Args:
-        df: DataFrame containing trading data
-        
-    Returns:
-        List of validation issues found
-    """
-    issues = []
-    
-    # Check for negative volumes
-    volume_columns = df.filter(like='volume').columns
-    for col in volume_columns:
-        if (df[col] < 0).any():
-            issues.append(f"Negative values found in {col}")
-    
-    return issues
-
-def clean_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Clean the trading data by handling missing values and outliers.
-    
-    Args:
-        df: DataFrame containing trading data
-        
-    Returns:
-        Cleaned DataFrame
-    """
-    logger.info("Starting data cleaning process")
-    
-    # Store original shape for logging
-    original_shape = df.shape
+    # Remove duplicates
+    n_duplicates = df.index.duplicated().sum()
+    if n_duplicates:
+        logger.warning(f"Found {n_duplicates} duplicate timestamps - removing")
+        df = df[~df.index.duplicated(keep='first')]
     
     # Handle missing values
-    numeric_columns = df.select_dtypes(include=[np.number]).columns
-    for col in numeric_columns:
-        # Fill missing values with forward fill, then backward fill
-        df[col] = df[col].ffill().bfill()
+    missing_by_col = df.isnull().sum()
+    if missing_by_col.any():
+        logger.warning("Missing values found:")
+        for col, count in missing_by_col[missing_by_col > 0].items():
+            logger.warning(f"  {col}: {count} missing values")
         
-        # For any remaining NaN (if both ffill and bfill failed),
-        # fill with column median
-        if df[col].isna().any():
-            df[col] = df[col].fillna(df[col].median())
+        # Forward fill price-based columns
+        price_cols = [col for col in df.columns if 'price' in col.lower()]
+        df[price_cols] = df[price_cols].ffill()  # Using ffill() instead of fillna(method='ffill')
+        
+        # Forward fill volume with 0
+        volume_cols = [col for col in df.columns if 'volume' in col.lower()]
+        df[volume_cols] = df[volume_cols].fillna(0)
+        
+        # Drop any remaining rows with missing values
+        df = df.dropna()
     
-    # Handle outliers using winsorization with more aggressive thresholds
-    # for better outlier control
-    price_columns = df.filter(like='price').columns
-    for col in price_columns:
-        # Calculate median and IQR for robust outlier detection
+    # Remove outliers (prices/volumes that are extreme multiples of median)
+    for col in df.select_dtypes(include=[np.number]).columns:
+        if df[col].isna().all():  # Skip columns that are all NaN
+            continue
+            
         median = df[col].median()
-        q1 = df[col].quantile(0.25)
-        q3 = df[col].quantile(0.75)
-        iqr = q3 - q1
+        mad = np.median(np.abs(df[col] - median))
         
-        # Define bounds using IQR method (1.5 * IQR)
-        lower = q1 - 1.5 * iqr
-        upper = q3 + 1.5 * iqr
+        if mad == 0:  # Skip if MAD is 0 (constant values)
+            continue
+            
+        threshold = 10  # Number of MADs for outlier detection
+        outliers = np.abs(df[col] - median) > threshold * mad
+        n_outliers = outliers.sum()
         
-        # Clip values to bounds
-        df[col] = df[col].clip(lower=lower, upper=upper)
-        
-        # Log significant outliers
-        outliers = df[col][(df[col] < lower) | (df[col] > upper)]
-        if not outliers.empty:
-            logger.info(f"Clipped {len(outliers)} outliers in {col}")
+        if n_outliers > 0:  # Check if there are any outliers
+            logger.warning(f"Found {n_outliers} outliers in {col}")
+            df.loc[outliers, col] = np.nan
+            df[col] = df[col].ffill()  # Using ffill() instead of fillna(method='ffill')
     
-    # Log cleaning results
-    logger.info(f"Data shape before cleaning: {original_shape}")
-    logger.info(f"Data shape after cleaning: {df.shape}")
+    # Sort by timestamp
+    df = df.sort_index()
     
+    # Add basic derived columns if price exists
+    if 'price' in df.columns:
+        df['log_return'] = np.log(df['price'] / df['price'].shift(1))
+        if 'volume' in df.columns:
+            df['volume_notional'] = df['price'] * df['volume']
+    
+    logger.info(f"Data cleaning complete. Shape: {df.shape}")
     return df
 
-def validate_and_clean_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Main function to validate and clean the trading data.
+def merge_data(prices_df: pd.DataFrame, orders_df: pd.DataFrame) -> pd.DataFrame:
+    """Merge price and order data."""
+    # Remove duplicate timestamps first
+    prices_df = prices_df[~prices_df.index.duplicated(keep='first')]
+    orders_df = orders_df[~orders_df.index.duplicated(keep='first')]
     
-    Args:
-        df: DataFrame containing trading data
-        
-    Returns:
-        Cleaned and validated DataFrame
-    """
-    # Run validations
-    price_issues = validate_price_data(df)
-    volume_issues = validate_volume_data(df)
+    # Ensure both DataFrames have the same index frequency
+    freq = pd.Timedelta(seconds=1)  # 1-second frequency
     
-    # Log validation issues
-    all_issues = price_issues + volume_issues
-    if all_issues:
-        for issue in all_issues:
-            logger.warning(f"Validation issue found: {issue}")
-    else:
-        logger.info("No validation issues found")
+    # Generate a complete range of timestamps
+    full_range = pd.date_range(
+        start=min(prices_df.index.min(), orders_df.index.min()),
+        end=max(prices_df.index.max(), orders_df.index.max()),
+        freq=freq
+    )
     
-    # Clean data
-    cleaned_df = clean_data(df)
+    # Reindex both DataFrames to the full range and forward fill
+    prices_resampled = prices_df.reindex(full_range).ffill()  # Using ffill() instead of fillna(method='ffill')
+    orders_resampled = orders_df.reindex(full_range).ffill()  # Using ffill() instead of fillna(method='ffill')
     
-    return cleaned_df
+    # Merge the DataFrames
+    merged = pd.concat([prices_resampled, orders_resampled], axis=1)
+    
+    # Drop any remaining rows with all missing values
+    merged = merged.dropna(how='all')
+    
+    logger.info(f"Data merge complete. Shape: {merged.shape}")
+    return merged
