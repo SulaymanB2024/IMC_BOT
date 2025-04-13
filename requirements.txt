@@ -1,0 +1,11 @@
+pandas>=1.5.0
+numpy>=1.21.0
+ta>=0.10.0  # Technical Analysis library
+plotly>=5.13.0  # Interactive plots
+pyarrow>=9.0.0  # For parquet support
+pyyaml>=6.0
+python-dotenv>=1.0.0
+scikit-learn>=1.0.0  # For potential future ML features
+statsmodels>=0.14.0  # For statistical tests and time series decomposition
+kaleido>=0.2.1  # For static plot export support
+seaborn>=0.12.0  # For additional visualization features

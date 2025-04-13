@@ -1,0 +1,185 @@
+# Data Sources
+input:
+  zip_file: "round-2-island-data-bottle.zip"
+  spreadsheet_patterns:
+    - "*_prices.csv"    # Assumed naming pattern for price data
+    - "*_orders.csv"    # Assumed naming pattern for order data
+
+# Data Processing Parameters
+processing:
+  time_alignment:
+    resample_freq: "1T"  # 1 minute
+    fill_method: "ffill"
+  join_keys:
+    - "timestamp"
+    - "symbol"
+
+# Feature Engineering Parameters
+features:
+  technical_indicators:
+    sma_windows: [5, 10, 20]
+    ema_windows: [5, 10, 20]
+    rsi_period: 14
+    bollinger_bands:
+      window: 20
+      num_std: 2
+    macd:
+      fast_period: 12
+      slow_period: 26
+      signal_period: 9
+    adx_period: 14  # For trend strength detection
+  
+  volatility:
+    std_windows: [5, 10, 20]
+    
+  lags:
+    price_lags: [1, 2, 3, 5]
+    volume_lags: [1, 2, 3]
+
+  # New: Market Regime Detection
+  regime_detection:
+    enabled: true
+    volatility:
+      source: "atr"  # Options: "atr" or "rolling_stddev"
+      window: 20
+      thresholds:
+        low: 0.01   # Below this is considered low volatility
+        high: 0.03  # Above this is considered high volatility
+    trend:
+      enabled: true
+      method: "adx"  # Using ADX for trend strength
+      threshold: 25  # ADX above this indicates strong trend
+      ma_comparison: true  # Also use MA slope for trend direction
+      ma_window: 20
+    
+  # New: Signal Generation
+  signal_generation:
+    enabled: true
+    macd:
+      signal_cross_enabled: true
+      zero_cross_enabled: true
+      divergence_enabled: true  # For detecting price/MACD divergences
+    rsi:
+      enabled: true
+      oversold: 30
+      overbought: 70
+    ma_crossover:
+      enabled: true
+      fast_ma: 5
+      slow_ma: 20
+    volume_surge:
+      enabled: true
+      threshold: 2.0  # Multiple of average volume
+      window: 20
+    
+  anomaly_detection:
+    z_score_window: 20
+    threshold: 3.0
+    
+  statistical_features:
+    rolling_window: 30
+    target_columns: ['price']
+    metrics: ['skew', 'kurt']
+    
+  interaction_features:
+    pairs:
+      - ['price', 'volume']
+      - ['price', 'rsi']
+      - ['volume', 'macd']
+    types: ['multiply', 'ratio']
+
+# Anomaly Detection Parameters
+anomaly_detection:
+  enabled: true
+  method: 'IsolationForest'
+  features_to_use:
+    - 'price'
+    - 'volume'
+    - 'rsi'
+    - 'macd'
+    - 'price_rolling_skew_30'
+    - 'price_rolling_kurt_30'
+    - 'price_volume_multiply'
+    - 'volatility_20'
+  contamination: 'auto'
+  n_estimators: 100
+  max_samples: 'auto'
+  random_state: 42
+  output_column_name: 'anomaly_flag_iforest'
+
+# Statistical Analysis Parameters
+statistical_analysis:
+  enabled: true
+  # --- Stationarity Tests ---
+  stationarity_tests:
+    run_adf: true
+    columns_to_test:
+      - 'price'
+      - 'volume'
+      - 'rsi'
+      - 'macd'
+      - 'volatility_20'
+      - 'price_zscore'
+      - 'price_rolling_skew_30'
+      - 'price_rolling_kurt_30'
+    adf_significance_level: 0.05
+  # --- Granger Causality Tests ---
+  granger_causality_tests:
+    run_granger: true
+    max_lag: 5
+    pairs_to_test:
+      - [['price'], ['volume']]  # Test if volume Granger-causes price
+      - [['price'], ['rsi']]     # Test if RSI Granger-causes price
+      - [['price'], ['macd']]    # Test if MACD Granger-causes price
+      - [['volume'], ['volatility_20']]  # Test if volatility Granger-causes volume
+      - [['price'], ['bb_upper', 'bb_lower']]  # Test if Bollinger Bands Granger-cause price
+    granger_significance_level: 0.05
+  # --- Output ---
+  results_output_file: "outputs/web_dashboard/statistical_test_results.json"
+
+# Output Settings
+output:
+  trading_model:
+    path: "outputs/trading_model/features.parquet"
+    compression: "snappy"
+  
+  dashboard:
+    path: "outputs/web_dashboard"
+    plot_format: "html"  # Changed from json to html for interactive plots
+
+# Visualization Settings
+visualization:
+  # Time series decomposition settings
+  plot_decomposition: true
+  decomposition_column: 'price'
+  decomposition_model: 'additive'
+  decomposition_period: 20  # For detecting seasonality
+
+  # Feature distribution plots
+  plot_feature_distributions: true
+  distribution_columns:
+    - 'price_zscore'
+    - 'rsi'
+    - 'macd'
+    - 'price_rolling_skew_30'
+    - 'volatility_20'
+    - 'anomaly_flag_iforest'
+
+  # Anomaly visualization
+  plot_anomalies_on_timeseries: true
+  anomaly_flag_column: 'anomaly_flag_iforest'
+  timeseries_base_column: 'price'
+
+  # Statistical test visualization
+  plot_statistical_tests: true
+  correlation_heatmap_columns:
+    - 'price'
+    - 'volume'
+    - 'rsi'
+    - 'macd'
+    - 'volatility_20'
+
+# Logging Configuration
+logging:
+  level: "INFO"
+  file: "pipeline.log"

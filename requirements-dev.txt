@@ -1,0 +1,4 @@
+pytest>=7.0.0
+pytest-cov>=4.0.0  # For test coverage reporting
+flake8>=6.0.0      # For code style checking
+black>=23.0.0      # For code formatting
