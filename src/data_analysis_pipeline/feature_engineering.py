@@ -13,92 +13,132 @@ from .config import get_config
 logger = logging.getLogger(__name__)
 
 def add_technical_indicators(df: pd.DataFrame, price_col: str = 'price') -> pd.DataFrame:
-    """Add technical indicators to the DataFrame.
-    
-    Args:
-        df: DataFrame containing trading data
-        price_col: Name of the price column to use for calculations
-        
-    Returns:
-        DataFrame with added technical indicators
-    """
+    """Add technical indicators to the DataFrame."""
     logger.info("Calculating technical indicators")
     config = get_config().feature_config['technical_indicators']
     
-    # Make a copy to avoid modifying original
     result = df.copy()
+    n_periods = len(df)
     
-    # Simple Moving Averages
-    for window in config['sma_windows']:
-        result[f'sma_{window}'] = ta.trend.sma_indicator(result[price_col], window=window)
+    # Adjust window sizes for small datasets
+    max_window = max(n_periods // 5, 2)  # At least 2 periods
+    
+    # Simple Moving Averages with adjusted windows
+    sma_windows = [min(w, max_window) for w in config['sma_windows']]
+    for window in sma_windows:
+        result[f'sma_{window}'] = ta.trend.sma_indicator(
+            result[price_col], 
+            window=window,
+            fillna=True
+        )
     
     # Exponential Moving Averages
-    for window in config['ema_windows']:
-        result[f'ema_{window}'] = ta.trend.ema_indicator(result[price_col], window=window)
+    ema_windows = [min(w, max_window) for w in config['ema_windows']]
+    for window in ema_windows:
+        result[f'ema_{window}'] = ta.trend.ema_indicator(
+            result[price_col], 
+            window=window,
+            fillna=True
+        )
     
-    # RSI
-    result['rsi'] = ta.momentum.rsi(result[price_col], window=config['rsi_period'])
+    # RSI with adjusted period
+    rsi_period = min(config['rsi_period'], max_window)
+    result['rsi'] = ta.momentum.rsi(
+        result[price_col], 
+        window=rsi_period,
+        fillna=True
+    )
     
-    # MACD
+    # MACD with adjusted periods
+    macd_slow = min(config['macd']['slow_period'], max_window)
+    macd_fast = min(config['macd']['fast_period'], macd_slow - 1)
+    macd_signal = min(config['macd']['signal_period'], macd_fast - 1)
+    
     macd = ta.trend.MACD(
         result[price_col],
-        window_slow=config['macd']['slow_period'],
-        window_fast=config['macd']['fast_period'],
-        window_sign=config['macd']['signal_period']
+        window_slow=macd_slow,
+        window_fast=macd_fast,
+        window_sign=macd_signal,
+        fillna=True
     )
     result['macd'] = macd.macd()
     result['macd_signal'] = macd.macd_signal()
     result['macd_diff'] = macd.macd_diff()
     
-    # Bollinger Bands
+    # Bollinger Bands with adjusted window
+    bb_window = min(config['bollinger_bands']['window'], max_window)
     bb = ta.volatility.BollingerBands(
         result[price_col],
-        window=config['bollinger_bands']['window'],
-        window_dev=config['bollinger_bands']['num_std']
+        window=bb_window,
+        window_dev=config['bollinger_bands']['num_std'],
+        fillna=True
     )
     result['bb_upper'] = bb.bollinger_hband()
     result['bb_lower'] = bb.bollinger_lband()
     result['bb_mid'] = bb.bollinger_mavg()
     
-    logger.info("Technical indicators calculated successfully")
+    logger.info(f"Technical indicators calculated with adjusted windows (max_window={max_window})")
     return result
 
 def add_volatility_features(df: pd.DataFrame, price_col: str = 'price') -> pd.DataFrame:
-    """Add volatility-based features to the DataFrame.
-    
-    Args:
-        df: DataFrame containing trading data
-        price_col: Name of the price column to use for calculations
-        
-    Returns:
-        DataFrame with added volatility features
-    """
+    """Add volatility-based features to the DataFrame."""
     logger.info("Calculating volatility features")
     config = get_config().feature_config['volatility']
     
     result = df.copy()
+    n_periods = len(df)
+    max_window = max(n_periods // 5, 2)  # At least 2 periods
+    
+    # Calculate returns and ensure no infinite values
     returns = np.log(result[price_col]).diff()
+    returns = returns.replace([np.inf, -np.inf], np.nan)
     
-    # Rolling volatility for different windows
-    for window in config['std_windows']:
-        result[f'volatility_{window}'] = returns.rolling(window=window).std()
+    # Rolling volatility with adjusted windows
+    std_windows = [min(w, max_window) for w in config['std_windows']]
+    for window in std_windows:
+        result[f'volatility_{window}'] = returns.rolling(
+            window=window,
+            min_periods=1
+        ).std().fillna(method='bfill')
     
-    # Volatility regime (using 20-period volatility)
-    vol_20 = returns.rolling(window=20).std()
+    # Volatility regime using shorter window for small datasets
+    vol_window = min(20, max_window)
+    vol_20 = returns.rolling(window=vol_window, min_periods=1).std()
     
-    # Only calculate regimes if we have enough non-NaN values
-    if vol_20.notna().sum() >= 3:  # Need at least 3 points for 3 quantiles
-        result['vol_regime'] = pd.qcut(
-            vol_20.fillna(vol_20.mean()),  # Fill NaNs with mean for binning
-            q=3, 
-            labels=['low', 'medium', 'high'],
-            duplicates='drop'  # Handle potential duplicate bin edges
-        )
+    # Simple regime classification for very small datasets
+    if n_periods < 10:
+        result['vol_regime'] = 'medium'  # Default regime for very small datasets
     else:
-        # For small samples, assign medium volatility
-        result['vol_regime'] = 'medium'
+        try:
+            vol_unique = vol_20.dropna().unique()
+            if len(vol_unique) >= 3:
+                # Use quantiles if we have enough unique values
+                result['vol_regime'] = pd.qcut(
+                    vol_20.fillna(vol_20.mean()),
+                    q=3,
+                    labels=['low', 'medium', 'high'],
+                    duplicates='drop'
+                )
+            else:
+                # Simple threshold-based classification
+                vol_mean = vol_20.mean()
+                vol_std = vol_20.std()
+                
+                # Create bins with exactly one fewer label than bin edges
+                bins = [-np.inf, vol_mean - vol_std, vol_mean + vol_std, np.inf]  # 4 edges
+                labels = ['low', 'medium', 'high']  # 3 labels
+                
+                result['vol_regime'] = pd.cut(
+                    vol_20,
+                    bins=bins,
+                    labels=labels,
+                    include_lowest=True
+                )
+        except Exception as e:
+            logger.warning(f"Volatility regime classification failed: {str(e)}")
+            result['vol_regime'] = 'medium'
     
-    logger.info("Volatility features calculated successfully")
+    logger.info(f"Volatility features calculated with adjusted windows (max_window={max_window})")
     return result
 
 def add_lagged_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -254,89 +294,73 @@ def calculate_atr(df: pd.DataFrame, window: int = 14, price_col: str = 'price') 
     return atr
 
 def detect_market_regimes(df: pd.DataFrame, config: dict) -> pd.DataFrame:
-    """Detect market regimes based on volatility and trend.
-    
-    Args:
-        df: DataFrame containing price and indicator data
-        config: Configuration dictionary for regime detection
-        
-    Returns:
-        DataFrame with added regime columns
-    """
+    """Detect market regimes based on volatility and trend."""
     logger.info("Detecting market regimes")
     result = df.copy()
+    n_periods = len(df)
     
-    if not config['regime_detection']['enabled']:
+    if not config['regime_detection']['enabled'] or n_periods < 3:
         return result
-        
+    
+    # Adjust window sizes for small datasets
+    max_window = max(n_periods // 5, 2)
+    
     # Volatility regime
     vol_config = config['regime_detection']['volatility']
+    vol_window = min(vol_config['window'], max_window)
+    
     if vol_config['source'] == 'atr':
         volatility_metric = calculate_atr(
             result, 
-            window=min(vol_config['window'], len(result) // 2)  # Adjust window if data is small
+            window=vol_window,
+            price_col='price'
         )
     else:  # rolling_stddev
         volatility_metric = result['price'].pct_change().rolling(
-            window=min(vol_config['window'], len(result) // 2)
+            window=vol_window,
+            min_periods=1
         ).std()
     
     # Classify volatility regime
-    result['regime_volatility'] = pd.cut(
-        volatility_metric,
-        bins=[-np.inf, vol_config['thresholds']['low'], 
-              vol_config['thresholds']['high'], np.inf],
-        labels=['low', 'medium', 'high']
-    )
+    if n_periods < 10:
+        result['regime_volatility'] = 'medium'
+    else:
+        vol_mean = volatility_metric.mean()
+        vol_std = volatility_metric.std()
+        
+        # Create bins with exactly one fewer label than bin edges
+        bins = [-np.inf, vol_mean - vol_std/2, vol_mean + vol_std/2, np.inf]  # 4 edges
+        labels = ['low', 'medium', 'high']  # 3 labels
+        
+        result['regime_volatility'] = pd.cut(
+            volatility_metric,
+            bins=bins,
+            labels=labels,
+            include_lowest=True
+        )
     
     # Trend regime
     if config['regime_detection']['trend']['enabled']:
         trend_config = config['regime_detection']['trend']
+        ma_window = min(trend_config['ma_window'], max_window)
         
-        # Adjust window size for small datasets
-        window = min(trend_config['ma_window'], len(result) // 2)
+        # Simple trend detection for small datasets
+        ma = result['price'].rolling(window=ma_window, min_periods=1).mean()
+        ma_slope = ma.diff()
         
-        # Calculate trend using simpler method for small datasets
-        if len(result) < 20:  # If dataset is very small
-            ma = result['price'].rolling(window=window, min_periods=1).mean()
-            ma_slope = ma.diff()
-            
-            # Simple trend strength based on slope magnitude
-            slope_std = ma_slope.std()
-            result['trend_strength'] = np.where(
-                abs(ma_slope) > slope_std,
-                'strong',
-                'weak'
-            )
-            
-            result['trend_direction'] = np.where(
-                ma_slope > 0, 'up',
-                np.where(ma_slope < 0, 'down', 'sideways')
-            )
-        else:
-            # Use ADX for larger datasets
-            adx = trend.ADXIndicator(
-                high=result['price'].rolling(2, min_periods=1).max(),
-                low=result['price'].rolling(2, min_periods=1).min(),
-                close=result['price'],
-                window=window
-            )
-            result['adx'] = adx.adx()
-            
-            # Determine trend strength
-            result['trend_strength'] = pd.cut(
-                result['adx'],
-                bins=[-np.inf, trend_config['threshold'], np.inf],
-                labels=['weak', 'strong']
-            )
-            
-            # Determine trend direction using MA slope
-            ma = result['price'].rolling(window=window, min_periods=1).mean()
-            ma_slope = ma.diff()
-            result['trend_direction'] = np.where(
-                ma_slope > 0, 'up',
-                np.where(ma_slope < 0, 'down', 'sideways')
-            )
+        # Trend strength based on slope magnitude
+        slope_std = ma_slope.std() or 0.001  # Avoid division by zero
+        result['trend_strength'] = np.where(
+            abs(ma_slope) > slope_std,
+            'strong',
+            'weak'
+        )
+        
+        # Trend direction
+        result['trend_direction'] = np.where(
+            ma_slope > 0, 'up',
+            np.where(ma_slope < 0, 'down', 'sideways')
+        )
         
         # Combine strength and direction
         result['regime_trend'] = result.apply(
@@ -346,7 +370,7 @@ def detect_market_regimes(df: pd.DataFrame, config: dict) -> pd.DataFrame:
             axis=1
         )
     
-    logger.info("Market regime detection complete")
+    logger.info(f"Market regime detection complete with adjusted windows (max_window={max_window})")
     return result
 
 def generate_trading_signals(df: pd.DataFrame, config: dict) -> pd.DataFrame:
@@ -444,32 +468,51 @@ def generate_features(df: pd.DataFrame) -> pd.DataFrame:
     # Generate features sequentially
     result = df.copy()
     
-    # Technical indicators
+    # Technical indicators (preserving rows)
     result = add_technical_indicators(result)
+    logger.info(f"After technical indicators: {result.shape}")
     
     # Volatility features
     result = add_volatility_features(result)
+    logger.info(f"After volatility features: {result.shape}")
     
     # Market regimes
     result = detect_market_regimes(result, config)
+    logger.info(f"After market regimes: {result.shape}")
     
     # Trading signals
     result = generate_trading_signals(result, config)
+    logger.info(f"After trading signals: {result.shape}")
     
     # Lagged features
     result = add_lagged_features(result)
+    logger.info(f"After lagged features: {result.shape}")
     
     # Anomaly detection
     result = add_anomaly_detection_features(result)
+    logger.info(f"After anomaly detection: {result.shape}")
     
     # Rolling statistical features
     result = add_rolling_statistical_features(result)
+    logger.info(f"After statistical features: {result.shape}")
     
     # Interaction features
     result = add_interaction_features(result)
+    logger.info(f"After interaction features: {result.shape}")
     
-    # Remove any remaining NaN values from feature calculation
-    result.dropna(inplace=True)
+    # Handle NaN values more carefully
+    # 1. Forward fill then backward fill technical indicators and volatility features
+    indicator_cols = [col for col in result.columns if any(x in col.lower() for x in 
+                     ['sma', 'ema', 'rsi', 'macd', 'bb_', 'volatility'])]
+    result[indicator_cols] = result[indicator_cols].ffill().bfill()
+    
+    # 2. Forward fill regime and signal columns
+    regime_cols = [col for col in result.columns if 'regime' in col.lower()]
+    signal_cols = [col for col in result.columns if 'signal' in col.lower()]
+    result[regime_cols + signal_cols] = result[regime_cols + signal_cols].ffill()
+    
+    # 3. Drop rows only if critical columns (price, volume) are missing
+    result.dropna(subset=['price', 'volume'], inplace=True)
     
     logger.info(f"Feature generation complete. Final shape: {result.shape}")
     return result

@@ -9,3 +9,4 @@ scikit-learn>=1.0.0  # For potential future ML features
 statsmodels>=0.14.0  # For statistical tests and time series decomposition
 kaleido>=0.2.1  # For static plot export support
 seaborn>=0.12.0  # For additional visualization features
+hmmlearn>=0.3.0  # For Hidden Markov Model analysis

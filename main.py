@@ -9,10 +9,11 @@ from src.data_analysis_pipeline.data_ingestion import load_trading_data, merge_d
 from src.data_analysis_pipeline.data_cleaning import validate_and_clean_data
 from src.data_analysis_pipeline.feature_engineering import generate_features
 from src.data_analysis_pipeline.anomaly_detection import detect_anomalies
+from src.data_analysis_pipeline.hmm_analysis import run_hmm_analysis
 from src.data_analysis_pipeline.statistical_analysis import run_statistical_tests
 from src.data_analysis_pipeline.output_generation import save_outputs
 from src.data_analysis_pipeline.insight_generation import generate_insights
-from src.data_analysis_pipeline.llm_output import generate_llm_output
+from src.data_analysis_pipeline.llm_output_generator import generate_llm_summary
 
 def parse_args():
     """Parse command line arguments."""
@@ -57,6 +58,10 @@ def run_pipeline(config_path: str):
     feature_data = detect_anomalies(feature_data)
     logger.info("Anomaly detection complete")
     
+    # Run HMM analysis
+    feature_data = run_hmm_analysis(feature_data)
+    logger.info("HMM analysis complete")
+    
     # Run statistical tests
     run_statistical_tests(feature_data)
     logger.info("Statistical analysis complete")
@@ -65,9 +70,9 @@ def run_pipeline(config_path: str):
     generate_insights(feature_data)
     logger.info("Market insights generated")
     
-    # Generate LLM-optimized output
-    generate_llm_output(feature_data)
-    logger.info("LLM-optimized output generated")
+    # Generate LLM-optimized summary
+    generate_llm_summary(feature_data)
+    logger.info("LLM-optimized summary generated")
     
     # Save outputs
     save_outputs(feature_data)

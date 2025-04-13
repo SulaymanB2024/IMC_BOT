@@ -52,6 +52,41 @@ def run_adf_test(series: pd.Series) -> Dict[str, Any]:
             'is_stationary': {'1%': None, '5%': None, '10%': None}
         }
 
+def prepare_for_granger(series: pd.Series) -> pd.Series:
+    """Prepare a time series for Granger causality testing by ensuring stationarity.
+    
+    Args:
+        series: Original time series
+        
+    Returns:
+        Stationary version of the series
+    """
+    # First try: use the series as is
+    adf_result = adfuller(series.dropna())[1]
+    
+    if adf_result < 0.05:
+        return series
+        
+    # Second try: take first difference
+    diff = series.diff().dropna()
+    adf_result = adfuller(diff)[1]
+    
+    if adf_result < 0.05:
+        logger.info(f"Using first difference for {series.name}")
+        return diff
+        
+    # Third try: take log returns
+    if (series > 0).all():
+        log_ret = np.log(series).diff().dropna()
+        adf_result = adfuller(log_ret)[1]
+        
+        if adf_result < 0.05:
+            logger.info(f"Using log returns for {series.name}")
+            return log_ret
+            
+    logger.warning(f"Could not achieve stationarity for {series.name}")
+    return series
+
 def run_granger_test(data: pd.DataFrame, dependent: List[str], independent: List[str], 
                     max_lag: int) -> Dict[str, Any]:
     """Run Granger causality test.
@@ -66,110 +101,141 @@ def run_granger_test(data: pd.DataFrame, dependent: List[str], independent: List
         Dictionary containing test results for each lag
     """
     try:
-        # Prepare data for test
-        test_data = pd.concat([
-            data[dependent].mean(axis=1),  # If multiple dependent vars, take mean
-            data[independent].mean(axis=1)  # Same for independent vars
-        ], axis=1)
-        test_data = test_data.dropna()
+        # Prepare dependent variable (take mean if multiple)
+        dep_series = data[dependent].mean(axis=1) if len(dependent) > 1 else data[dependent[0]]
+        dep_series.name = '_'.join(dependent)
         
+        # Prepare independent variable (take mean if multiple)
+        ind_series = data[independent].mean(axis=1) if len(independent) > 1 else data[independent[0]]
+        ind_series.name = '_'.join(independent)
+        
+        # Ensure stationarity
+        dep_stationary = prepare_for_granger(dep_series)
+        ind_stationary = prepare_for_granger(ind_series)
+        
+        # Combine and clean data
+        test_data = pd.DataFrame({
+            'dependent': dep_stationary,
+            'independent': ind_stationary
+        }).dropna()
+        
+        # Check if we have enough data
+        min_observations = max_lag * 3  # Require at least 3 observations per lag
+        if len(test_data) < min_observations:
+            raise ValueError(f"Insufficient observations ({len(test_data)}) for max_lag={max_lag}")
+            
         # Run test
         results = grangercausalitytests(test_data, maxlag=max_lag, verbose=False)
         
-        # Extract p-values for each lag
+        # Extract results
         granger_results = {}
         for lag in range(1, max_lag + 1):
-            # Get F-test results (index 0) and its p-value (index 1)
+            # Get F-test results
             f_stat = results[lag][0]['ssr_ftest'][0]
             p_value = results[lag][0]['ssr_ftest'][1]
             granger_results[str(lag)] = {
                 'f_statistic': f_stat,
-                'p_value': p_value
+                'p_value': p_value,
+                'significant': p_value < 0.05
             }
             
         return {
             'results_by_lag': granger_results,
             'dependent_vars': dependent,
-            'independent_vars': independent
+            'independent_vars': independent,
+            'n_observations': len(test_data),
+            'transformation': {
+                'dependent': 'original' if dep_series.equals(dep_stationary) else 
+                            'diff' if dep_series.diff().dropna().equals(dep_stationary) else 'log_returns',
+                'independent': 'original' if ind_series.equals(ind_stationary) else 
+                             'diff' if ind_series.diff().dropna().equals(ind_stationary) else 'log_returns'
+            }
         }
         
     except Exception as e:
         logger.error(f"Granger causality test failed: {str(e)}")
         return {
             'error': str(e),
-            'results_by_lag': {},
             'dependent_vars': dependent,
             'independent_vars': independent
         }
 
-def run_statistical_tests(df: pd.DataFrame) -> None:
-    """Run all configured statistical tests on the data.
+def run_statistical_tests(df: pd.DataFrame) -> Dict[str, Any]:
+    """Run statistical tests on the data.
     
     Args:
-        df: DataFrame containing features to analyze
-    """
-    logger.info("Starting statistical analysis")
-    config = get_config()
-    stat_config = config.statistical_analysis
-    
-    # Check if analysis is enabled
-    if not stat_config.get('enabled', False):
-        logger.info("Statistical analysis disabled in config")
-        return
-    
-    results = {'stationarity_tests': {}, 'granger_causality_tests': {}}
-    
-    # Run stationarity tests
-    if stat_config['stationarity_tests']['run_adf']:
-        logger.info("Running stationarity tests")
-        columns = stat_config['stationarity_tests']['columns_to_test']
-        sig_level = stat_config['stationarity_tests']['adf_significance_level']
+        df: DataFrame containing trading data
         
-        for col in columns:
+    Returns:
+        Dictionary containing test results
+    """
+    logger.info("Running statistical tests")
+    results = {
+        'stationarity_tests': {},
+        'granger_causality_tests': {}
+    }
+    
+    try:
+        # ADF test for stationarity
+        for col in ['price', 'volume']:
             if col not in df.columns:
-                logger.warning(f"Column {col} not found, skipping ADF test")
                 continue
                 
-            logger.info(f"Testing stationarity of {col}")
-            adf_result = run_adf_test(df[col])
-            results['stationarity_tests'][col] = adf_result
-            
-            # Log result summary
-            if adf_result.get('p_value') is not None:
-                is_stationary = adf_result['p_value'] < sig_level
-                logger.info(f"{col}: {'Stationary' if is_stationary else 'Non-stationary'} "
-                          f"(p-value: {adf_result['p_value']:.4f})")
-    
-    # Run Granger causality tests
-    if stat_config['granger_causality_tests']['run_granger']:
-        logger.info("Running Granger causality tests")
-        pairs = stat_config['granger_causality_tests']['pairs_to_test']
-        max_lag = stat_config['granger_causality_tests']['max_lag']
-        sig_level = stat_config['granger_causality_tests']['granger_significance_level']
+            adf_result = adfuller(df[col].dropna())
+            results['stationarity_tests'][col] = {
+                'statistic': adf_result[0],
+                'p_value': adf_result[1],
+                'critical_values': adf_result[4]
+            }
         
-        for pair_idx, (dependent, independent) in enumerate(pairs):
-            # Check if all columns exist
-            if not all(col in df.columns for col in dependent + independent):
-                missing = [col for col in dependent + independent if col not in df.columns]
-                logger.warning(f"Columns {missing} not found, skipping Granger test for pair {pair_idx}")
+        # Granger causality tests
+        config = get_config()
+        test_pairs = config.statistical_analysis['granger_causality_tests']['pairs_to_test']
+        maxlag = min(
+            config.statistical_analysis['granger_causality_tests']['max_lag'],
+            len(df) // 10  # More conservative max lag
+        )
+        
+        logger.info(f"Running Granger causality tests with max_lag={maxlag}")
+        
+        for dep, ind in test_pairs:
+            # Skip if any variables are missing
+            if not all(x in df.columns for x in dep + ind):
+                logger.warning(f"Skipping Granger test for {ind}->{dep}: missing columns")
                 continue
+                
+            try:
+                gc_result = run_granger_test(df, dep, ind, maxlag)
+                if 'error' not in gc_result:
+                    results['granger_causality_tests'][f"{'_'.join(ind)}_to_{'_'.join(dep)}"] = gc_result
+                    logger.info(f"Completed Granger test for {ind}->{dep}")
+                else:
+                    logger.warning(f"Granger test failed for {ind}->{dep}: {gc_result['error']}")
+                    
+            except Exception as e:
+                logger.warning(f"Granger test failed for {ind}->{dep}: {str(e)}")
+        
+        # Save results
+        output_dir = Path(config.output_config['dashboard']['path'])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        with open(output_dir / 'statistical_test_results.json', 'w') as f:
+            json.dump(results, f, indent=2, cls=NumpyEncoder)
             
-            logger.info(f"Testing Granger causality: {' & '.join(independent)} -> {' & '.join(dependent)}")
-            granger_result = run_granger_test(df, dependent, independent, max_lag)
-            results['granger_causality_tests'][f"pair_{pair_idx}"] = granger_result
-            
-            # Log result summary
-            if 'error' not in granger_result:
-                min_p_value = min(lag['p_value'] for lag in granger_result['results_by_lag'].values())
-                significant = min_p_value < sig_level
-                logger.info(f"Granger causality {'found' if significant else 'not found'} "
-                          f"(minimum p-value across lags: {min_p_value:.4f})")
-    
-    # Save results
-    output_path = Path(stat_config['results_output_file'])
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(output_path, 'w') as f:
-        json.dump(results, f, indent=2)
-    
-    logger.info(f"Statistical analysis results saved to {output_path}")
+        logger.info("Statistical tests completed successfully")
+        return results
+        
+    except Exception as e:
+        logger.error(f"Statistical tests failed: {str(e)}")
+        return results
+        
+class NumpyEncoder(json.JSONEncoder):
+    """Custom JSON encoder for numpy types."""
+    def default(self, obj):
+        if isinstance(obj, (np.integer, np.floating)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.bool_, bool)):
+            return bool(obj)
+        return super(NumpyEncoder, self).default(obj)

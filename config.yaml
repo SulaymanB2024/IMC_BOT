@@ -1,9 +1,7 @@
 # Data Sources
 input:
-  zip_file: "round-2-island-data-bottle.zip"
-  spreadsheet_patterns:
-    - "*_prices.csv"    # Assumed naming pattern for price data
-    - "*_orders.csv"    # Assumed naming pattern for order data
+  data_dir: "data"
+  file_pattern: "*.csv"
 
 # Data Processing Parameters
 processing:
@@ -17,40 +15,40 @@ processing:
 # Feature Engineering Parameters
 features:
   technical_indicators:
-    sma_windows: [5, 10, 20]
-    ema_windows: [5, 10, 20]
-    rsi_period: 14
+    sma_windows: [3, 5, 10]  # Shorter windows for small datasets
+    ema_windows: [3, 5, 10]
+    rsi_period: 5
     bollinger_bands:
-      window: 20
+      window: 5
       num_std: 2
     macd:
-      fast_period: 12
-      slow_period: 26
-      signal_period: 9
-    adx_period: 14  # For trend strength detection
+      fast_period: 6
+      slow_period: 12
+      signal_period: 4
+    adx_period: 5  # For trend strength detection
   
   volatility:
-    std_windows: [5, 10, 20]
+    std_windows: [3, 5, 10]
     
   lags:
-    price_lags: [1, 2, 3, 5]
-    volume_lags: [1, 2, 3]
+    price_lags: [1, 2, 3]
+    volume_lags: [1, 2]
 
-  # New: Market Regime Detection
+  # Market Regime Detection
   regime_detection:
     enabled: true
     volatility:
-      source: "atr"  # Options: "atr" or "rolling_stddev"
-      window: 20
+      source: "rolling_stddev"  # Options: "atr" or "rolling_stddev"
+      window: 5
       thresholds:
         low: 0.01   # Below this is considered low volatility
         high: 0.03  # Above this is considered high volatility
     trend:
       enabled: true
-      method: "adx"  # Using ADX for trend strength
-      threshold: 25  # ADX above this indicates strong trend
+      method: "sma"  # Using SMA for trend strength
+      threshold: 25  # SMA above this indicates strong trend
       ma_comparison: true  # Also use MA slope for trend direction
-      ma_window: 20
+      ma_window: 5
     
   # New: Signal Generation
   signal_generation:
@@ -58,22 +56,21 @@ features:
     macd:
       signal_cross_enabled: true
       zero_cross_enabled: true
-      divergence_enabled: true  # For detecting price/MACD divergences
     rsi:
       enabled: true
       oversold: 30
       overbought: 70
     ma_crossover:
       enabled: true
-      fast_ma: 5
-      slow_ma: 20
+      fast_ma: 3
+      slow_ma: 5
     volume_surge:
       enabled: true
       threshold: 2.0  # Multiple of average volume
-      window: 20
+      window: 5
     
   anomaly_detection:
-    z_score_window: 20
+    z_score_window: 5
     threshold: 3.0
     
   statistical_features:
@@ -137,6 +134,84 @@ statistical_analysis:
   # --- Output ---
   results_output_file: "outputs/web_dashboard/statistical_test_results.json"
 
+# HMM Analysis Parameters
+hmm_analysis:
+  enabled: true
+  n_hidden_states: 2  # Reduced states for small datasets
+  
+  # Covariance type determines how feature relationships are modeled within states:
+  # - 'spherical': Simplest model. Features independent, same variance. Best for scaled, uncorrelated features.
+  # - 'diag': Features independent, different variances. Good default choice.
+  # - 'full': Features can be correlated within states. Most flexible but needs more data.
+  # - 'tied': All states share same covariance matrix. Middle ground between diag and full.
+  covariance_type: "diag"
+  
+  n_iterations: 100  # Maximum EM algorithm iterations
+  random_state: 42    # For reproducibility
+  
+  # Features used to detect market regimes
+  features_to_use:
+    - "log_return"      # Price movement
+    - "volume"          # Volume
+    - "volatility_5"    # Market volatility
+    - "rsi"            # Momentum
+    - "macd"           # Trend
+  
+  output_column_name: "hmm_regime"  # Column name for detected states
+  
+  # Feature scaling options
+  feature_scaling:
+    enabled: true
+    method: "robust"  # More robust to outliers
+
+# New: LLM Output Generation Parameters
+llm_output_generation:
+  enabled: true
+  output_file: "outputs/llm_insights/run_summary.md"
+  
+  # Content inclusion flags
+  include_statistical_summary: true
+  include_anomaly_summary: true
+  include_hmm_summary: true
+  include_regime_summary: true
+  include_recent_signal_summary: true
+  include_data_quality_summary: true    # New: control data quality section
+  include_state_characteristics: true   # New: control state characteristics analysis
+  include_state_persistence: true       # New: control state persistence analysis
+  
+  # Analysis periods for recent summaries
+  summary_periods: [5, 10, 20]
+  
+  # File paths for auxiliary data
+  hmm_interpretations_file: "outputs/web_dashboard/hmm_interpretations.json"
+  statistical_results_file: "outputs/web_dashboard/statistical_test_results.json"
+  
+  # New: State characteristics analysis configuration
+  state_characteristics:
+    target_columns:
+      - "price"
+      - "volume"
+      - "volatility_5"
+      - "rsi"
+      - "macd"
+    metrics:
+      - "mean"
+      - "std"
+      - "median"
+      - "min"
+      - "max"
+  
+  # New: Data quality analysis configuration
+  data_quality:
+    time_gap_threshold: "1H"    # Maximum acceptable time gap
+    significant_missing_threshold: 1.0  # % threshold for reporting missing data
+    check_columns:  # Columns to check for quality issues
+      - "price"
+      - "volume"
+      - "rsi"
+      - "macd"
+      - "volatility_5"
+
 # Output Settings
 output:
   trading_model:
@@ -146,6 +221,7 @@ output:
   dashboard:
     path: "outputs/web_dashboard"
     plot_format: "html"  # Changed from json to html for interactive plots
+    interactive: true
 
 # Visualization Settings
 visualization:
@@ -153,17 +229,15 @@ visualization:
   plot_decomposition: true
   decomposition_column: 'price'
   decomposition_model: 'additive'
-  decomposition_period: 20  # For detecting seasonality
+  decomposition_period: 5  # Shorter period for small datasets
 
   # Feature distribution plots
   plot_feature_distributions: true
   distribution_columns:
-    - 'price_zscore'
+    - 'price'
+    - 'volume'
+    - 'volatility_5'
     - 'rsi'
-    - 'macd'
-    - 'price_rolling_skew_30'
-    - 'volatility_20'
-    - 'anomaly_flag_iforest'
 
   # Anomaly visualization
   plot_anomalies_on_timeseries: true
@@ -175,9 +249,19 @@ visualization:
   correlation_heatmap_columns:
     - 'price'
     - 'volume'
+    - 'volatility_5'
     - 'rsi'
-    - 'macd'
-    - 'volatility_20'
+
+  # HMM visualization settings
+  hmm_visualization:
+    enabled: true
+    regime_colors:
+      volatile_bullish: 'rgba(0, 255, 0, 0.2)'   # Green
+      volatile_bearish: 'rgba(255, 0, 0, 0.2)'   # Red
+      calm_neutral: 'rgba(128, 128, 128, 0.2)'   # Gray
+    show_annotations: true
+    show_probabilities: true
+    probability_window: 20  # Window for rolling probabilities
 
 # Logging Configuration
 logging:
