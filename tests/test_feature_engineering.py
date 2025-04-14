@@ -9,7 +9,8 @@ from src.data_analysis_pipeline.feature_engineering import (
     add_lagged_features,
     detect_market_regimes,
     generate_trading_signals,
-    calculate_atr
+    calculate_atr,
+    prepare_hmm_features
 )
 
 class MockConfig:
@@ -247,3 +248,77 @@ def test_atr_calculation(sample_price_data):
     # ATR should be non-negative for valid values
     valid_atr = atr.dropna()
     assert (valid_atr >= 0).all(), "ATR values should be non-negative"
+
+def test_volatility_regime_calculation(sample_price_data):
+    """Test improved volatility regime calculation with quantile-based bins."""
+    result = add_volatility_features(sample_price_data)
+    
+    # Check regime column exists
+    assert 'vol_regime' in result.columns, "Missing volatility regime column"
+    
+    # Check regime values are valid
+    valid_regimes = ['low', 'medium', 'high']
+    assert result['vol_regime'].dropna().isin(valid_regimes).all(), "Invalid regime values"
+    
+    # Check distribution makes sense (should have all three regimes)
+    regime_counts = result['vol_regime'].value_counts()
+    assert len(regime_counts) == 3, "Missing some regime classifications"
+    
+    # Verify no NaN values
+    assert not result['vol_regime'].isna().any(), "Found NaN values in regime classification"
+
+def test_hmm_feature_preparation(sample_price_data):
+    """Test HMM feature preparation and scaling."""
+    config = get_config().hmm_analysis
+    
+    # Prepare features
+    X_scaled = prepare_hmm_features(sample_price_data, config)
+    
+    # Check output shape
+    expected_features = ['log_return', 'volume', 'volatility_5', 'rsi', 'macd']
+    assert X_scaled.shape[1] == len(expected_features), "Incorrect number of features"
+    
+    # Check scaling properties
+    assert np.abs(X_scaled.mean(axis=0)).max() < 0.1, "Features not properly centered"
+    assert np.abs(X_scaled.std(axis=0) - 1.0).max() < 0.1, "Features not properly scaled"
+    
+    # Check no NaN or infinite values
+    assert not np.isnan(X_scaled).any(), "Found NaN values after preparation"
+    assert not np.isinf(X_scaled).any(), "Found infinite values after preparation"
+
+def test_technical_indicators_small_dataset():
+    """Test technical indicator calculation with very small datasets."""
+    # Create minimal test data
+    small_data = pd.DataFrame({
+        'price': [100, 101, 99, 102, 98],
+        'volume': [1000, 1100, 900, 1200, 800]
+    }, index=pd.date_range('2025-04-12', periods=5, freq='T'))
+    
+    result = add_technical_indicators(small_data)
+    
+    # Check that indicators were calculated despite small size
+    assert 'sma_5' in result.columns, "Missing SMA indicator"
+    assert 'rsi' in result.columns, "Missing RSI indicator"
+    assert not result['sma_5'].isna().any(), "Found NaN values in SMA"
+    assert not result['rsi'].isna().any(), "Found NaN values in RSI"
+
+def test_market_regime_detection_edge_cases(sample_price_data):
+    """Test market regime detection with various edge cases."""
+    # Test with very small dataset
+    small_data = sample_price_data.head(3)
+    result_small = detect_market_regimes(small_data, get_config().feature_config)
+    assert 'regime_volatility' in result_small.columns, "Missing volatility regime for small data"
+    assert result_small['regime_volatility'].notna().all(), "NaN values in small data regime"
+    
+    # Test with constant price (zero volatility)
+    const_data = sample_price_data.copy()
+    const_data['price'] = 100
+    result_const = detect_market_regimes(const_data, get_config().feature_config)
+    assert 'regime_volatility' in result_const.columns, "Missing volatility regime for constant data"
+    assert result_const['regime_volatility'].notna().all(), "NaN values in constant data regime"
+    
+    # Test with missing values
+    missing_data = sample_price_data.copy()
+    missing_data.loc[missing_data.index[1:3], 'price'] = np.nan
+    result_missing = detect_market_regimes(missing_data, get_config().feature_config)
+    assert 'regime_volatility' in result_missing.columns, "Missing volatility regime for data with NaN"

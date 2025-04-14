@@ -235,7 +235,7 @@ def load_order_data(file: str) -> Optional[pd.DataFrame]:
             return None
             
         if (df['volume'] < 0).any():
-            logger.warning(f"Negative volumes found in {file}, taking absolute values")
+            logger.warning(f"Negative volumes found in {file, taking absolute values")
             df['volume'] = df['volume'].abs()
             
         return df
@@ -263,11 +263,11 @@ def merge_data(prices_df: pd.DataFrame, orders_df: pd.DataFrame) -> pd.DataFrame
         # Create standardized DataFrame with aligned timestamps
         freq = config.processing_config['time_alignment'].get('resample_freq', '1T')
         
-        # Resample price data
+        # Resample price data with forward fill
         prices_resampled = prices_df.resample(freq).agg({
             'mid_price': 'last',
             'day': 'last'
-        }).fillna(method='ffill')
+        }).ffill()  # Use ffill() instead of fillna(method='ffill')
         
         # Create standardized price column
         prices_resampled['price'] = prices_resampled['mid_price']
@@ -293,9 +293,9 @@ def merge_data(prices_df: pd.DataFrame, orders_df: pd.DataFrame) -> pd.DataFrame
             result['day'] = result['day_price'].combine_first(result['day_trade'])
             result.drop(['day_price', 'day_trade'], axis=1, inplace=True)
         
-        # Handle missing values
-        result['price'] = result['price'].fillna(method='ffill').fillna(method='bfill')
-        result['volume'] = result['volume'].fillna(0)
+        # Handle missing values more robustly
+        result['price'] = result['price'].ffill().bfill()  # Forward then backward fill
+        result['volume'] = result['volume'].fillna(0)      # Fill missing volumes with 0
         
         # Verify merged data quality
         if result.empty:

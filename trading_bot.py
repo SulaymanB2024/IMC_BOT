@@ -3,7 +3,7 @@ import os
 import logging
 import pandas as pd
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from datamodel import OrderDepth, TradingState, Order
 
 logger = logging.getLogger(__name__)
@@ -14,17 +14,23 @@ class FeatureBasedTrader:
         self.features_df = None
         self._load_features()
         
-        # Market making parameters
+        # Add memoization for timestamp lookup
+        self._last_timestamp = None
+        self._last_features = None
+        
+        # Market making parameters with safeguards
         self.base_spread = 0.5  # Default spread
-        self.base_order_size = 10  # Default order size
+        self.min_spread = 0.1   # Minimum allowed spread
+        self.base_order_size = 10
+        self.min_order_size = 1
         
-        # Signal thresholds for volume skewing
-        self.strong_signal_threshold = 40.0
-        self.weak_signal_threshold = 10.0
+        # Signal thresholds with validation
+        self.strong_signal_threshold = min(max(40.0, 20.0), 80.0)  # Clamp between 20-80
+        self.weak_signal_threshold = min(max(10.0, 5.0), 30.0)    # Clamp between 5-30
         
-        # Volume skew multipliers
-        self.strong_volume_multiplier = 1.5
-        self.weak_volume_multiplier = 1.2
+        # Volume multipliers with validation
+        self.strong_volume_multiplier = min(max(1.5, 1.1), 2.0)  # Clamp between 1.1-2.0
+        self.weak_volume_multiplier = min(max(1.2, 1.1), 1.5)    # Clamp between 1.1-1.5
         
     def _load_features(self) -> None:
         """Load pre-generated features from parquet file."""
@@ -35,15 +41,66 @@ class FeatureBasedTrader:
                 return
                 
             self.features_df = pd.read_parquet(features_path)
-            self.features_df.index = pd.to_datetime(self.features_df.index)
+            
+            # Ensure datetime index
+            if not isinstance(self.features_df.index, pd.DatetimeIndex):
+                logger.warning("Converting index to datetime")
+                self.features_df.index = pd.to_datetime(self.features_df.index)
+            
             self.features_df.sort_index(inplace=True)
             
-            logger.info(f"Successfully loaded features data with shape {self.features_df.shape}")
+            # Validate required columns
+            required_cols = ['composite_signal', 'regime_volatility', 'regime_trend']
+            missing_cols = [col for col in required_cols if col not in self.features_df.columns]
+            if missing_cols:
+                logger.warning(f"Missing required columns: {missing_cols}")
+            
+            logger.info(f"Loaded features data with shape {self.features_df.shape}")
             logger.info(f"Features time range: {self.features_df.index.min()} to {self.features_df.index.max()}")
             
         except Exception as e:
             logger.error(f"Error loading features: {str(e)}")
             self.features_df = None
+            
+    def _get_features_for_timestamp(self, timestamp: int) -> Optional[pd.Series]:
+        """Get features for a specific timestamp with memoization.
+        
+        Args:
+            timestamp: Current timestamp from TradingState
+            
+        Returns:
+            Series containing features or None if not found
+        """
+        if self.features_df is None:
+            return None
+            
+        # Check memoized result
+        if timestamp == self._last_timestamp and self._last_features is not None:
+            return self._last_features
+            
+        try:
+            # Convert timestamp to datetime
+            current_timestamp = pd.Timestamp('2025-04-12') + pd.Timedelta(seconds=timestamp)
+            
+            # Use asof to get most recent features (robust to missing timestamps)
+            features = self.features_df.asof(current_timestamp)
+            
+            # Validate feature freshness (no older than 5 minutes)
+            if features is not None:
+                feature_age = (current_timestamp - features.name).total_seconds()
+                if feature_age > 300:  # 5 minutes
+                    logger.warning(f"Features too old: {feature_age:.1f} seconds")
+                    features = None
+            
+            # Update memoization
+            self._last_timestamp = timestamp
+            self._last_features = features
+            
+            return features
+            
+        except Exception as e:
+            logger.error(f"Error getting features: {str(e)}")
+            return None
             
     def _calculate_skewed_volumes(self, composite_signal: float) -> tuple[int, int]:
         """Calculate bid and ask volumes based on composite signal strength.
@@ -54,8 +111,11 @@ class FeatureBasedTrader:
         Returns:
             tuple: (bid_volume, ask_volume) as integers
         """
+        # Ensure signal is within bounds
+        composite_signal = max(min(composite_signal, 100), -100)
+        
         # Start with base volume
-        base_vol = self.base_order_size
+        base_vol = max(self.base_order_size, self.min_order_size)
         
         # Strong bullish
         if composite_signal >= self.strong_signal_threshold:
@@ -103,29 +163,8 @@ class FeatureBasedTrader:
         orders = {}
         
         # Get current timestamp
-        current_timestamp = pd.Timestamp(state.timestamp)
-        latest_features = None
-        
-        # Attempt to look up current features
-        if self.features_df is not None:
-            try:
-                # Get most recent features relative to current timestamp
-                latest_features = self.features_df.loc[self.features_df.index.asof(current_timestamp)]
-                
-                # Log key market state indicators
-                logger.info(
-                    f"T={current_timestamp}: Features found - "
-                    f"HMM={latest_features.get('hmm_regime_label', 'N/A')}, "
-                    f"Signal={latest_features.get('composite_signal', 'N/A'):.1f}, "
-                    f"Volatility={latest_features.get('regime_volatility', 'N/A')}, "
-                    f"Trend={latest_features.get('regime_trend', 'N/A')}, "
-                    f"Anomaly={latest_features.get('anomaly_flag_iforest', 'N/A')}"
-                )
-                
-            except KeyError as e:
-                logger.warning(f"No features found for timestamp {current_timestamp}: {str(e)}")
-            except Exception as e:
-                logger.error(f"Error looking up features: {str(e)}")
+        current_timestamp = state.timestamp
+        latest_features = self._get_features_for_timestamp(current_timestamp)
         
         # Process each product
         for product in state.order_depths.keys():

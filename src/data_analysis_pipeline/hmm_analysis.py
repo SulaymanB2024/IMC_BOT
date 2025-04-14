@@ -1,142 +1,309 @@
 """Hidden Markov Model analysis for market state detection."""
 import logging
-import numpy as np
+import json
 import pandas as pd
+import numpy as np
+from typing import Dict, Any
 from hmmlearn import hmm
-from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
 from pathlib import Path
 
 from .config import get_config
 
 logger = logging.getLogger(__name__)
 
-def prepare_features_for_hmm(df: pd.DataFrame, config: dict) -> tuple:
-    """Prepare features for HMM analysis."""
-    # Get features to use
-    features = config['hmm_analysis']['features_to_use']
-    available_features = [f for f in features if f in df.columns]
+def prepare_hmm_features(df: pd.DataFrame, config: dict) -> np.ndarray:
+    """Prepare and scale features for HMM training."""
+    # Select features with good predictive power
+    features = ['log_return', 'volume', 'volatility_5', 'rsi', 'macd']
+    X = df[features].copy()
     
-    if not available_features:
-        raise ValueError("No valid features available for HMM analysis")
+    # Handle missing values using newer pandas methods
+    X = X.ffill().bfill()
     
-    # Extract and scale features
-    X = df[available_features].copy()
-    X = X.fillna(method='ffill').fillna(method='bfill')
+    # Remove outliers using IQR method
+    for col in X.columns:
+        q1 = X[col].quantile(0.25)
+        q3 = X[col].quantile(0.75)
+        iqr = q3 - q1
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+        X[col] = X[col].clip(lower_bound, upper_bound)
     
-    if config['hmm_analysis']['feature_scaling']['enabled']:
-        scaler = RobustScaler()
-        X_scaled = scaler.fit_transform(X)
-    else:
-        X_scaled = X.values
+    # Standard scaling for better HMM convergence
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
     
-    return X_scaled, available_features
+    # Add small noise to break exact zeros
+    X_scaled += np.random.normal(0, 1e-6, X_scaled.shape)
+    
+    # Ensure the output is a 2D array (n_samples, n_features)
+    if len(X_scaled.shape) != 2:
+        X_scaled = X_scaled.reshape(-1, len(features))
+    
+    return X_scaled
 
-def fit_hmm(X: np.ndarray, config: dict) -> hmm.GaussianHMM:
-    """Fit HMM model to the data."""
-    model = hmm.GaussianHMM(
-        n_components=config['hmm_analysis']['n_hidden_states'],
-        covariance_type=config['hmm_analysis']['covariance_type'],
-        n_iter=config['hmm_analysis']['n_iterations'],
-        random_state=config['hmm_analysis']['random_state']
+def initialize_hmm(n_states: int, n_features: int, x_data: np.ndarray, covariance_type: str = 'diag') -> hmm.GaussianHMM:
+    """Initialize HMM with smart starting parameters."""
+    hmm_model = hmm.GaussianHMM(
+        n_components=n_states,
+        covariance_type=covariance_type,
+        n_iter=200,
+        tol=1e-5,
+        init_params='',  # Disable automatic initialization
+        random_state=42
     )
     
-    # Try multiple initializations
+    # Set required dimensions
+    hmm_model.n_features = n_features
+    
+    # Initialize transition matrix with high self-transition probabilities
+    transitions = np.ones((n_states, n_states)) * 0.1
+    np.fill_diagonal(transitions, 0.9)
+    transitions /= transitions.sum(axis=1, keepdims=True)
+    hmm_model.transmat_ = transitions
+    
+    # Initialize means using k-means
+    kmeans = KMeans(n_clusters=n_states, random_state=42)
+    kmeans.fit(x_data)
+    hmm_model.means_ = kmeans.cluster_centers_
+    
+    # Initialize covariances based on k-means clusters
+    if covariance_type == 'diag':
+        covars = np.zeros((n_states, n_features))
+        for i in range(n_states):
+            cluster_points = x_data[kmeans.labels_ == i]
+            if len(cluster_points) > 1:
+                covars[i] = np.var(cluster_points, axis=0) + 1e-3
+            else:
+                covars[i] = np.ones(n_features) * 0.1
+    else:  # full covariance
+        covars = np.zeros((n_states, n_features, n_features))
+        for i in range(n_states):
+            cluster_points = x_data[kmeans.labels_ == i]
+            if len(cluster_points) > 1:
+                cov = np.cov(cluster_points.T) + np.eye(n_features) * 1e-3
+                covars[i] = cov
+            else:
+                covars[i] = np.eye(n_features) * 0.1
+    
+    hmm_model.covars_ = covars
+    
+    # Set startprob to uniform distribution
+    hmm_model.startprob_ = np.ones(n_states) / n_states
+    
+    return hmm_model
+
+def train_hmm(data: pd.DataFrame, config: dict) -> Dict[str, Any]:
+    """Train HMM model with improved convergence handling."""
+    logger.info("Starting HMM analysis")
+    
+    # Prepare features
+    X_scaled = prepare_hmm_features(data, config)
+    features_used = ['log_return', 'volume', 'volatility_5', 'rsi', 'macd']
+    logger.info(f"Prepared {len(features_used)} features for HMM: {features_used}")
+    
+    # Ensure data is 2D array (n_samples, n_features)
+    if len(X_scaled.shape) != 2:
+        raise ValueError(f"Expected 2D array, got shape {X_scaled.shape}")
+    
+    # Training parameters
+    n_states = config['n_hidden_states']
+    covariance_type = config['covariance_type']
+    n_attempts = 3
+    
     best_score = float('-inf')
     best_model = None
     
-    for i in range(config['hmm_analysis']['n_init']):
+    for attempt in range(1, n_attempts + 3):
+        logger.info(f"HMM training attempt {attempt}/{n_attempts}")
         try:
-            model.fit(X)
-            score = model.score(X)
+            # Initialize model with smart starting values
+            hmm_model = initialize_hmm(n_states, X_scaled.shape[1], X_scaled, covariance_type)
+            
+            # Ensure all model attributes are properly set
+            if not hasattr(hmm_model, 'n_features') or hmm_model.n_features != X_scaled.shape[1]:
+                hmm_model.n_features = X_scaled.shape[1]
+            
+            # Fit model with sequences
+            lengths = [len(X_scaled)]  # Single continuous sequence
+            hmm_model.fit(X_scaled, lengths)
+            
+            score = hmm_model.score(X_scaled)
+            logger.info(f"Attempt {attempt} score: {score:.2f}")
             
             if score > best_score:
                 best_score = score
-                best_model = model
+                best_model = hmm_model
                 
         except Exception as e:
-            logger.warning(f"HMM fitting attempt {i+1} failed: {str(e)}")
+            logger.warning(f"Training attempt {attempt} failed: {str(e)}")
             continue
     
     if best_model is None:
-        raise RuntimeError("Failed to fit HMM model")
+        raise RuntimeError("All HMM training attempts failed")
     
-    return best_model
-
-def interpret_states(model: hmm.GaussianHMM, feature_names: list) -> dict:
-    """Interpret the characteristics of each HMM state."""
-    interpretations = {}
+    logger.info(f"Selected best model with score: {best_score:.2f}")
     
-    for state in range(model.n_components):
-        state_mean = model.means_[state]
-        state_cov = model.covars_[state] if model.covariance_type == 'diag' else np.diag(model.covars_[state])
+    # Decode states
+    states = best_model.predict(X_scaled)
+    state_probs = best_model.predict_proba(X_scaled)
+    
+    # Calculate state characteristics
+    state_stats = {}
+    for state in range(n_states):
+        mask = (states == state)
+        state_data = data[mask]
         
-        # Create interpretation for each state
-        state_chars = {}
-        for i, feature in enumerate(feature_names):
-            state_chars[feature] = {
-                'mean': state_mean[i],
-                'std': np.sqrt(state_cov[i])
+        # Calculate mean characteristics for this state
+        means = {col: float(state_data[col].mean()) for col in features_used}
+        
+        # Interpret state characteristics
+        characteristics = []
+        
+        # Trend interpretation
+        if means['log_return'] > 0.001:
+            characteristics.append('bullish')
+        elif means['log_return'] < -0.001:
+            characteristics.append('bearish')
+        else:
+            characteristics.append('neutral')
+            
+        # Volatility interpretation
+        vol = means['volatility_5']
+        if vol < np.percentile(data['volatility_5'], 33):
+            characteristics.append('low volatility')
+        elif vol > np.percentile(data['volatility_5'], 66):
+            characteristics.append('high volatility')
+        else:
+            characteristics.append('medium volatility')
+            
+        # RSI interpretation
+        if means['rsi'] < 30:
+            characteristics.append('oversold')
+        elif means['rsi'] > 70:
+            characteristics.append('overbought')
+        else:
+            characteristics.append('neutral RSI')
+            
+        # MACD interpretation
+        if means['macd'] > 0:
+            characteristics.append('strong momentum')
+        else:
+            characteristics.append('weak momentum')
+        
+        state_stats[f"state_{state}"] = {
+            'means': means,
+            'characteristics': characteristics,
+            'probability': float(np.mean(state_probs[:, state])),
+            'duration_stats': {
+                'mean': float(get_state_durations(states == state).mean()),
+                'std': float(get_state_durations(states == state).std()),
+                'max': int(get_state_durations(states == state).max())
             }
-        
-        interpretations[f'state_{state}'] = state_chars
+        }
     
     # Save interpretations
+    results = {
+        'model_info': {
+            'n_states': n_states,
+            'covariance_type': covariance_type,
+            'score': float(best_score),
+            'features_used': features_used,
+            'convergence_attempts': n_attempts
+        },
+        'states': state_stats,
+        'state_sequence': states.tolist(),
+        'state_probabilities': state_probs.tolist(),
+        'transition_matrix': best_model.transmat_.tolist(),
+        'means': best_model.means_.tolist(),
+        'covars': [cov.tolist() for cov in best_model.covars_],
+        'stationary_distribution': get_stationary_distribution(best_model.transmat_).tolist()
+    }
+    
+    # Save to dashboard
     output_path = Path('outputs/web_dashboard/hmm_interpretations.json')
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(interpretations).to_json(output_path)
     
-    return interpretations
+    try:
+        with open(output_path, 'w') as f:
+            json.dump(results, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save HMM interpretations: {str(e)}")
+    
+    logger.info("HMM analysis completed successfully")
+    return results
+
+def get_state_durations(state_mask: np.ndarray) -> np.ndarray:
+    """Calculate durations of consecutive True values in boolean array.
+    
+    Args:
+        state_mask: Boolean array indicating state membership
+        
+    Returns:
+        Array of state duration lengths
+    """
+    if len(state_mask) == 0:
+        return np.array([0])
+        
+    # Convert to int array
+    state_int = state_mask.astype(int)
+    
+    # Add sentinel values to handle edge cases
+    padded = np.r_[0, state_int, 0]
+    
+    # Find boundaries between different states
+    changes = np.where(np.diff(padded) != 0)[0]
+    
+    # If no True values found
+    if len(changes) == 0:
+        return np.array([0] if state_int[0] == 0 else [len(state_int)])
+    
+    # Convert change points to runs
+    changes = changes.reshape(-1, 2)
+    
+    # Calculate durations of True runs
+    durations = changes[:, 1] - changes[:, 0]
+    
+    return durations
+
+def get_stationary_distribution(transition_matrix: np.ndarray) -> np.ndarray:
+    """Calculate the stationary distribution of a Markov chain."""
+    eigenvals, eigenvecs = np.linalg.eig(transition_matrix.T)
+    stationary = eigenvecs[:, np.argmax(np.real(eigenvals))]
+    return np.real(stationary / np.sum(stationary))
 
 def run_hmm_analysis(df: pd.DataFrame) -> pd.DataFrame:
     """Run HMM analysis on market data."""
     result = df.copy()
     config = get_config()
     
-    if not config.get('hmm_analysis', {}).get('enabled', False):
+    if not config.hmm_analysis.get('enabled', False):
+        logger.info("HMM analysis disabled in config")
         return result
     
     try:
-        # Prepare features
-        X_scaled, feature_names = prepare_features_for_hmm(result, config)
-        logger.info(f"Prepared {len(feature_names)} features for HMM analysis")
+        # Train HMM model
+        hmm_results = train_hmm(result, config.hmm_analysis)
         
-        # Fit model
-        model = fit_hmm(X_scaled, config)
-        logger.info("HMM model fitted successfully")
+        # Add state sequence to DataFrame
+        result['hmm_regime'] = hmm_results['state_sequence']
+        result['hmm_regime_prob'] = [
+            max(probs) for probs in hmm_results['state_probabilities']
+        ]
         
-        # Predict states
-        states = model.predict(X_scaled)
-        state_probs = model.predict_proba(X_scaled)
+        # Add regime characteristics
+        regime_chars = {
+            i: '_'.join(info['characteristics'])
+            for i, (state, info) in enumerate(hmm_results['states'].items())
+        }
+        result['hmm_regime_char'] = result['hmm_regime'].map(regime_chars)
         
-        # Add predictions to results
-        result[config['hmm_analysis']['output_column_name']] = states
-        
-        # Add state probabilities
-        for i in range(model.n_components):
-            result[f'hmm_state_{i}_prob'] = state_probs[:, i]
-        
-        # Generate and save state interpretations
-        interpretations = interpret_states(model, feature_names)
-        logger.info("State interpretations generated")
-        
-        # Label states based on volatility and trend
-        volatility_state = pd.Series(states).map({
-            i: 'volatile' if interpretations[f'state_{i}']['volatility_20']['mean'] > 0 else 'calm'
-            for i in range(model.n_components)
-        })
-        
-        trend_state = pd.Series(states).map({
-            i: 'bullish' if interpretations[f'state_{i}']['log_return']['mean'] > 0 else 'bearish'
-            for i in range(model.n_components)
-        })
-        
-        result['hmm_regime_label'] = volatility_state + '_' + trend_state
-        
-        n_states = len(np.unique(states))
-        logger.info(f"HMM analysis complete with {n_states} states identified")
-        
+        logger.info("HMM regime detection completed successfully")
         return result
         
     except Exception as e:
         logger.error(f"HMM analysis failed: {str(e)}")
+        # Return original DataFrame if analysis fails
         return result

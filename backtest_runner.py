@@ -17,29 +17,83 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def load_market_data(zip_path: str, day: int, symbol: Optional[str] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Load price and trade data for a specific day from the zip archive."""
+    """Load price and trade data for a specific day from the zip archive with caching."""
+    # Define cache paths
+    cache_dir = Path('data/processed')
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    price_cache = cache_dir / f'prices_day_{day}.parquet'
+    trade_cache = cache_dir / f'trades_day_{day}.parquet'
+    
+    # Try loading from cache first
+    if price_cache.exists() and trade_cache.exists():
+        try:
+            price_data = pd.read_parquet(price_cache)
+            trade_data = pd.read_parquet(trade_cache)
+            logger.info(f"Loaded data from cache for day {day}")
+            
+            if symbol and symbol != "ALL":
+                price_data = price_data[price_data['product'] == symbol]
+                trade_data = trade_data[trade_data['symbol'] == symbol]
+                
+            return price_data, trade_data
+        except Exception as e:
+            logger.warning(f"Failed to load from cache: {str(e)}")
+    
+    # Load from zip if cache missing or invalid
     with ZipFile(zip_path) as zf:
-        # Load price data
+        # Load price data efficiently
         price_file = f"round-2-island-data-bottle/prices_round_2_day_{day}.csv"
-        price_data = pd.read_csv(zf.open(price_file), sep=';')
-        logger.info(f"Loaded {len(price_data)} price records")
+        price_data = pd.read_csv(
+            zf.open(price_file),
+            sep=';',
+            engine='c',  # Use C engine for better performance
+            dtype={  # Specify dtypes to avoid inference
+                'timestamp': np.int64,
+                'product': str,
+                'bid_price_1': np.float32,
+                'ask_price_1': np.float32,
+                'bid_volume_1': np.int32,
+                'ask_volume_1': np.int32
+            }
+        )
         
-        # Load trade data
+        # Load trade data efficiently
         trade_file = f"round-2-island-data-bottle/trades_round_2_day_{day}.csv"
-        trade_data = pd.read_csv(zf.open(trade_file), sep=';')
-        logger.info(f"Loaded {len(trade_data)} trade records")
+        trade_data = pd.read_csv(
+            zf.open(trade_file),
+            sep=';',
+            engine='c',
+            dtype={
+                'timestamp': np.int64,
+                'symbol': str,
+                'price': np.float32,
+                'quantity': np.int32,
+                'buyer': str,
+                'seller': str
+            }
+        )
+    
+    logger.info(f"Loaded {len(price_data)} price records, {len(trade_data)} trade records")
+    
+    # Convert timestamps to datetime
+    base_date = pd.Timestamp('2025-04-12')
+    price_data['dt'] = base_date + pd.to_timedelta(price_data['timestamp'], unit='s')
+    
+    # Cache the full data
+    try:
+        price_data.to_parquet(price_cache, engine='fastparquet', compression='snappy')
+        trade_data.to_parquet(trade_cache, engine='fastparquet', compression='snappy')
+        logger.info(f"Cached data for day {day}")
+    except Exception as e:
+        logger.warning(f"Failed to cache data: {str(e)}")
     
     # Filter by symbol if specified
     if symbol and symbol != "ALL":
         price_data = price_data[price_data['product'] == symbol]
         trade_data = trade_data[trade_data['symbol'] == symbol]
-        logger.info(f"After filtering for {symbol}: {len(price_data)} price records, {len(trade_data)} trade records")
-        
-    # Convert timestamps to datetime for compatibility with features
-    base_date = pd.Timestamp('2025-04-12')
-    price_data['dt'] = base_date + pd.to_timedelta(price_data['timestamp'].astype(int), unit='s')
+        logger.info(f"Filtered data for {symbol}")
     
-    logger.info(f"Price data time range: {price_data['dt'].min()} to {price_data['dt'].max()}")
     return price_data, trade_data
 
 def create_order_depth(row: pd.Series) -> OrderDepth:
@@ -115,91 +169,137 @@ def simulate_fills(
     cash: float,
     trade_log: List[dict]
 ) -> Tuple[Dict[str, int], float]:
-    """Simulate order fills using next timestamp's market data.
-    
-    Args:
-        orders: Dictionary of orders from trader
-        next_market_data: Market data for next timestamp
-        positions: Current positions dictionary
-        cash: Current cash balance
-        trade_log: List to record trade executions
-        
-    Returns:
-        Tuple of (updated positions dict, updated cash)
-    """
+    """Simulate order fills using next timestamp's market data."""
     position_limits = defaultdict(lambda: 100)  # Default 100 position limit per symbol
     
     for product, product_orders in orders.items():
         market_row = next_market_data[next_market_data['product'] == product]
         if market_row.empty:
+            logger.warning(f"No market data found for {product} - skipping orders")
             continue
             
         next_bid = market_row['bid_price_1'].iloc[0]
         next_ask = market_row['ask_price_1'].iloc[0]
         
-        for order in product_orders:
-            # Skip if would exceed position limits
-            if abs(positions.get(product, 0) + order.quantity) > position_limits[product]:
-                logger.warning(f"Order for {product} would exceed position limit - skipping")
-                continue
-                
-            # Simulate fill logic
-            if order.quantity > 0:  # Buy order
-                if order.price >= next_ask:
-                    positions[product] = positions.get(product, 0) + order.quantity
-                    cash -= order.quantity * next_ask
-                    trade_log.append({
-                        'timestamp': market_row['timestamp'].iloc[0],
-                        'product': product,
-                        'price': next_ask,
-                        'quantity': order.quantity,
-                        'side': 'BUY'
-                    })
-            else:  # Sell order
-                if order.price <= next_bid:
-                    positions[product] = positions.get(product, 0) + order.quantity  # quantity is negative
-                    cash -= order.quantity * next_bid  # negative quantity makes this a cash addition
-                    trade_log.append({
-                        'timestamp': market_row['timestamp'].iloc[0],
-                        'product': product,
-                        'price': next_bid,
-                        'quantity': order.quantity,
-                        'side': 'SELL'
-                    })
+        # Sort orders by price (best prices first)
+        buy_orders = sorted([o for o in product_orders if o.quantity > 0], 
+                          key=lambda x: x.price, reverse=True)  # Highest price first
+        sell_orders = sorted([o for o in product_orders if o.quantity < 0], 
+                           key=lambda x: x.price)  # Lowest price first
+        
+        # Track fills for this product in this iteration
+        total_bought = 0
+        total_sold = 0
+        
+        # Process buys
+        for order in buy_orders:
+            if order.price >= next_ask:  # Willing to pay the ask
+                new_position = positions.get(product, 0) + total_bought + order.quantity
+                if abs(new_position) > position_limits[product]:
+                    logger.warning(f"Order for {product} would exceed position limit - skipping")
+                    continue
                     
+                total_bought += order.quantity
+                cash -= order.quantity * next_ask
+                
+                trade_log.append({
+                    'timestamp': market_row['timestamp'].iloc[0],
+                    'product': product,
+                    'price': next_ask,
+                    'quantity': order.quantity,
+                    'side': 'BUY',
+                    'remaining_cash': cash
+                })
+        
+        # Process sells
+        for order in sell_orders:
+            if order.price <= next_bid:  # Willing to hit the bid
+                new_position = positions.get(product, 0) + total_sold + order.quantity
+                if abs(new_position) > position_limits[product]:
+                    logger.warning(f"Order for {product} would exceed position limit - skipping")
+                    continue
+                    
+                total_sold += order.quantity
+                cash -= order.quantity * next_bid  # quantity is negative for sells
+                
+                trade_log.append({
+                    'timestamp': market_row['timestamp'].iloc[0],
+                    'product': product,
+                    'price': next_bid,
+                    'quantity': order.quantity,
+                    'side': 'SELL',
+                    'remaining_cash': cash
+                })
+        
+        # Update position
+        if total_bought + total_sold != 0:
+            positions[product] = positions.get(product, 0) + total_bought + total_sold
+            logger.info(f"Updated {product} position to {positions[product]} after fills")
+    
     return positions, cash
 
 def calculate_pnl(
     positions: Dict[str, int],
     market_data: pd.DataFrame,
-    cash: float
+    cash: float,
+    trades: List[dict]
 ) -> Dict[str, float]:
     """Calculate PnL per symbol using last available prices.
     
     Args:
         positions: Final positions dictionary
         market_data: Complete market data DataFrame
-        cash: Final cash balance
+        cash: Final cash balance 
+        trades: List of executed trades for realized PnL calculation
         
     Returns:
-        Dictionary of PnL per symbol
+        Dictionary with unrealized PnL per symbol, realized PnL, and total PnL
     """
-    pnl = {'cash': cash}
+    pnl = {'cash': cash, 'realized': 0.0}
     
-    # Get last price for each product
-    last_prices = {}
+    # Calculate realized PnL from trades
+    position_tracker = defaultdict(int)
+    cost_basis = defaultdict(float)
+    
+    for trade in trades:
+        product = trade['product']
+        price = trade['price']
+        quantity = trade['quantity']
+        
+        # Update average cost basis
+        old_position = position_tracker[product]
+        old_cost = cost_basis[product] * old_position
+        
+        if old_position == 0:
+            cost_basis[product] = price
+        else:
+            # Weighted average for cost basis
+            cost_basis[product] = (old_cost + price * quantity) / (old_position + quantity)
+            
+        # If position direction changes, realize PnL
+        if old_position * (old_position + quantity) < 0:  # Direction changed
+            realized_pnl = (price - cost_basis[product]) * min(abs(old_position), abs(quantity))
+            pnl['realized'] += realized_pnl
+            
+        position_tracker[product] += quantity
+    
+    # Calculate unrealized PnL using last prices
     for product in positions.keys():
         product_data = market_data[market_data['product'] == product]
-        if not product_data.empty:
-            last_prices[product] = product_data['mid_price'].iloc[-1]
+        if product_data.empty:
+            logger.warning(f"No market data found for {product} - skipping PnL calculation")
+            continue
             
-    # Calculate PnL per symbol
-    for product, position in positions.items():
-        if product in last_prices:
-            pnl[product] = position * last_prices[product]
-            
-    # Add total
-    pnl['total'] = sum(pnl.values())
+        last_price = product_data['mid_price'].iloc[-1]
+        position = positions[product]
+        cost = cost_basis[product]
+        
+        unrealized_pnl = position * (last_price - cost)
+        pnl[f'{product}_unrealized'] = unrealized_pnl
+        
+    # Calculate totals
+    pnl['total_unrealized'] = sum(v for k, v in pnl.items() if k.endswith('_unrealized'))
+    pnl['total'] = pnl['cash'] + pnl['realized'] + pnl['total_unrealized']
     
     return pnl
 
@@ -258,7 +358,7 @@ def main():
             logger.info(f"Processed {i + 1}/{len(timestamps)} timestamps")
     
     # Calculate final PnL
-    pnl = calculate_pnl(positions, market_data, cash)
+    pnl = calculate_pnl(positions, market_data, cash, trade_log)
     
     # Print results
     logger.info("\n=== Backtest Results ===")
