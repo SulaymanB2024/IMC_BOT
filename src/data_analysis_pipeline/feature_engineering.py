@@ -2,7 +2,7 @@
 import logging
 import pandas as pd
 import numpy as np
-from typing import List, Dict
+from typing import List, Dict, Optional
 import ta  # Technical Analysis library
 from sklearn.preprocessing import StandardScaler
 from hmmlearn import hmm
@@ -454,67 +454,242 @@ def generate_trading_signals(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     return result
 
 def generate_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Main function to generate all features for the trading model.
+    """Generate all configured features."""
+    logger.info("Starting feature generation")
+    result = df.copy()
+    config = get_config()
     
-    Args:
-        df: DataFrame containing cleaned trading data
+    # Get pipeline mode
+    pipeline_mode = config.get('pipeline_mode', 'full_analysis')
+    logger.info(f"Generating features in {pipeline_mode} mode")
+    
+    try:
+        # Core Technical Indicators (always enabled)
+        if config['feature_engineering']['technical_indicators']['core_indicators']['enabled']:
+            result = add_core_technical_indicators(result)
         
-    Returns:
-        DataFrame with all calculated features
-    """
-    logger.info("Starting feature generation process")
-    config = get_config().feature_config
+        # Extended Technical Indicators (mode dependent)
+        if (pipeline_mode == 'full_analysis' and 
+            config['feature_engineering']['technical_indicators']['extended_indicators']['enabled']):
+            result = add_extended_technical_indicators(result)
+        
+        # Feature Groups
+        feature_groups = config['feature_engineering']['feature_groups']
+        
+        # Lagged Features (configurable)
+        if feature_groups['lagged_features']['enabled']:
+            result = add_lagged_features(
+                result,
+                max_lags=feature_groups['lagged_features']['max_lags']
+            )
+        
+        # Rolling Statistics (configurable)
+        if feature_groups['rolling_statistics']['enabled']:
+            result = add_rolling_statistics(
+                result,
+                windows=feature_groups['rolling_statistics']['windows'],
+                metrics=feature_groups['rolling_statistics']['metrics']
+            )
+        
+        # Long-term Features (only in full analysis mode)
+        if pipeline_mode == 'full_analysis' and feature_groups['long_term_features']['enabled']:
+            result = add_long_term_features(
+                result,
+                windows=feature_groups['long_term_features']['windows'],
+                metrics=feature_groups['long_term_features']['metrics']
+            )
+        
+        # Interaction Features (mode dependent)
+        if (pipeline_mode == 'full_analysis' and 
+            feature_groups['interaction_features']['enabled']):
+            result = add_interaction_features(
+                result,
+                pairs=feature_groups['interaction_features']['pairs']
+            )
+        
+        logger.info("Feature generation completed successfully")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error in feature generation: {str(e)}")
+        raise
+
+def add_core_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Add essential technical indicators."""
+    result = df.copy()
+    config = get_config()
+    core_config = config['feature_engineering']['technical_indicators']['core_indicators']
     
-    # Generate features sequentially
+    # SMA
+    if core_config['sma']['enabled']:
+        for window in core_config['sma']['windows']:
+            result[f'sma_{window}'] = ta.trend.sma_indicator(result['price'], window=window)
+    
+    # EMA
+    if core_config['ema']['enabled']:
+        for window in core_config['ema']['windows']:
+            result[f'ema_{window}'] = ta.trend.ema_indicator(result['price'], window=window)
+    
+    # RSI
+    if core_config['rsi']['enabled']:
+        result['rsi'] = ta.momentum.rsi(result['price'], window=core_config['rsi']['period'])
+    
+    # Volatility (essential)
+    if core_config['volatility']['enabled']:
+        for window in core_config['volatility']['windows']:
+            result[f'volatility_{window}'] = ta.volatility.standard_deviation(
+                result['price'],
+                window=window
+            )
+    
+    # Log returns (always calculated as needed by HMM)
+    result['log_return'] = np.log(result['price']).diff()
+    
+    return result
+
+def add_extended_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Add additional technical indicators for full analysis."""
+    result = df.copy()
+    config = get_config()
+    ext_config = config['feature_engineering']['technical_indicators']['extended_indicators']
+    
+    # Only proceed if extended indicators are enabled
+    if not ext_config['enabled']:
+        return result
+    
+    # Bollinger Bands
+    if ext_config['bollinger_bands']['enabled']:
+        bb_config = ext_config['bollinger_bands']
+        result['bb_high'] = ta.volatility.bollinger_hband(
+            result['price'],
+            window=bb_config['window'],
+            std=bb_config['num_std']
+        )
+        result['bb_low'] = ta.volatility.bollinger_lband(
+            result['price'],
+            window=bb_config['window'],
+            std=bb_config['num_std']
+        )
+    
+    # MACD
+    if ext_config['macd']['enabled']:
+        macd_config = ext_config['macd']
+        result['macd'] = ta.trend.macd(
+            result['price'],
+            fast=macd_config['fast_period'],
+            slow=macd_config['slow_period'],
+            signal=macd_config['signal_period']
+        )
+        result['macd_signal'] = ta.trend.macd_signal(
+            result['price'],
+            fast=macd_config['fast_period'],
+            slow=macd_config['slow_period'],
+            signal=macd_config['signal_period']
+        )
+    
+    # ADX
+    if ext_config['adx']['enabled']:
+        result['adx'] = ta.trend.adx(
+            high=result['price'] * 1.0001,  # Synthetic high
+            low=result['price'] * 0.9999,   # Synthetic low
+            close=result['price'],
+            window=ext_config['adx']['period']
+        )
+    
+    # Stochastic
+    if ext_config['stochastic']['enabled']:
+        stoch_config = ext_config['stochastic']
+        result['stoch_k'] = ta.momentum.stoch(
+            high=result['price'] * 1.0001,
+            low=result['price'] * 0.9999,
+            close=result['price'],
+            window=stoch_config['k_period'],
+            smooth_window=stoch_config['d_period']
+        )
+    
+    return result
+
+def add_rolling_statistics(
+    df: pd.DataFrame,
+    windows: List[int],
+    metrics: List[str]
+) -> pd.DataFrame:
+    """Add rolling statistical features."""
     result = df.copy()
     
-    # Technical indicators (preserving rows)
-    result = add_technical_indicators(result)
-    logger.info(f"After technical indicators: {result.shape}")
+    for window in windows:
+        rolling = result['price'].rolling(window=window)
+        
+        if 'mean' in metrics:
+            result[f'price_rolling_mean_{window}'] = rolling.mean()
+        if 'std' in metrics:
+            result[f'price_rolling_std_{window}'] = rolling.std()
+        if 'skew' in metrics:
+            result[f'price_rolling_skew_{window}'] = rolling.skew()
+        if 'kurt' in metrics:
+            result[f'price_rolling_kurt_{window}'] = rolling.kurt()
     
-    # Volatility features
-    result = add_volatility_features(result)
-    logger.info(f"After volatility features: {result.shape}")
+    return result
+
+def add_long_term_features(
+    df: pd.DataFrame,
+    windows: List[int],
+    metrics: List[str]
+) -> pd.DataFrame:
+    """Add long-term statistical features."""
+    result = df.copy()
     
-    # Market regimes
-    result = detect_market_regimes(result, config)
-    logger.info(f"After market regimes: {result.shape}")
+    for window in windows:
+        rolling = result['price'].rolling(window=window)
+        
+        for metric in metrics:
+            if metric == 'mean':
+                result[f'price_long_mean_{window}'] = rolling.mean()
+            elif metric == 'std':
+                result[f'price_long_std_{window}'] = rolling.std()
+            elif metric == 'skew':
+                result[f'price_long_skew_{window}'] = rolling.skew()
+            elif metric == 'kurt':
+                result[f'price_long_kurt_{window}'] = rolling.kurt()
     
-    # Trading signals
-    result = generate_trading_signals(result, config)
-    logger.info(f"After trading signals: {result.shape}")
+    return result
+
+def add_interaction_features(
+    df: pd.DataFrame,
+    pairs: List[List[str]]
+) -> pd.DataFrame:
+    """Add interaction features between pairs of columns."""
+    result = df.copy()
     
-    # Lagged features
-    result = add_lagged_features(result)
-    logger.info(f"After lagged features: {result.shape}")
+    for col1, col2 in pairs:
+        if col1 in result.columns and col2 in result.columns:
+            # Multiplication interaction
+            result[f'{col1}_{col2}_multiply'] = result[col1] * result[col2]
+            
+            # Ratio interaction (with safety check)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ratio = result[col1] / result[col2]
+                result[f'{col1}_{col2}_ratio'] = np.where(
+                    np.isfinite(ratio),
+                    ratio,
+                    0
+                )
     
-    # Anomaly detection
-    result = add_anomaly_detection_features(result)
-    logger.info(f"After anomaly detection: {result.shape}")
+    return result
+
+def add_lagged_features(
+    df: pd.DataFrame,
+    max_lags: int
+) -> pd.DataFrame:
+    """Add lagged versions of key features."""
+    result = df.copy()
     
-    # Rolling statistical features
-    result = add_rolling_statistical_features(result)
-    logger.info(f"After statistical features: {result.shape}")
+    # Add lags for price and volume
+    for lag in range(1, max_lags + 1):
+        result[f'price_lag_{lag}'] = result['price'].shift(lag)
+        if 'volume' in result.columns:
+            result[f'volume_lag_{lag}'] = result['volume'].shift(lag)
     
-    # Interaction features
-    result = add_interaction_features(result)
-    logger.info(f"After interaction features: {result.shape}")
-    
-    # Handle NaN values more carefully
-    # 1. Forward fill then backward fill technical indicators and volatility features
-    indicator_cols = [col for col in result.columns if any(x in col.lower() for x in 
-                     ['sma', 'ema', 'rsi', 'macd', 'bb_', 'volatility'])]
-    result[indicator_cols] = result[indicator_cols].ffill().bfill()
-    
-    # 2. Forward fill regime and signal columns
-    regime_cols = [col for col in result.columns if 'regime' in col.lower()]
-    signal_cols = [col for col in result.columns if 'signal' in col.lower()]
-    result[regime_cols + signal_cols] = result[regime_cols + signal_cols].ffill()
-    
-    # 3. Drop rows only if critical columns (price, volume) are missing
-    result.dropna(subset=['price', 'volume'], inplace=True)
-    
-    logger.info(f"Feature generation complete. Final shape: {result.shape}")
     return result
 
 def calculate_volatility_regimes(df: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:

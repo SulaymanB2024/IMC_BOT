@@ -3,7 +3,7 @@ import logging
 import json
 import pandas as pd
 import numpy as np
-from typing import Dict, Any
+from typing import Dict, Any, List
 from hmmlearn import hmm
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
@@ -15,8 +15,21 @@ logger = logging.getLogger(__name__)
 
 def prepare_hmm_features(df: pd.DataFrame, config: dict) -> np.ndarray:
     """Prepare and scale features for HMM training."""
-    # Select features with good predictive power
-    features = ['log_return', 'volume', 'volatility_5', 'rsi', 'macd']
+    pipeline_mode = config.get('pipeline_mode', 'full_analysis')
+    
+    # Select features based on pipeline mode
+    features = config['hmm_analysis']['features'][f'{pipeline_mode}_mode']
+    logger.info(f"Using {len(features)} features for HMM in {pipeline_mode} mode: {features}")
+    
+    # Validate feature availability
+    missing_features = [f for f in features if f not in df.columns]
+    if missing_features:
+        logger.warning(f"Missing features for HMM: {missing_features}")
+        features = [f for f in features if f in df.columns]
+        
+    if not features:
+        raise ValueError("No valid features available for HMM analysis")
+    
     X = df[features].copy()
     
     # Handle missing values using newer pandas methods
@@ -37,10 +50,6 @@ def prepare_hmm_features(df: pd.DataFrame, config: dict) -> np.ndarray:
     
     # Add small noise to break exact zeros
     X_scaled += np.random.normal(0, 1e-6, X_scaled.shape)
-    
-    # Ensure the output is a 2D array (n_samples, n_features)
-    if len(X_scaled.shape) != 2:
-        X_scaled = X_scaled.reshape(-1, len(features))
     
     return X_scaled
 
@@ -99,9 +108,17 @@ def train_hmm(data: pd.DataFrame, config: dict) -> Dict[str, Any]:
     """Train HMM model with improved convergence handling."""
     logger.info("Starting HMM analysis")
     
+    pipeline_mode = config.get('pipeline_mode', 'full_analysis')
+    hmm_config = config['hmm_analysis']
+    
+    # Use simpler model for trading mode
+    if pipeline_mode == 'trading':
+        hmm_config['n_iterations'] = min(hmm_config['n_iterations'], 1000)  # Limit iterations
+        hmm_config['n_init'] = min(hmm_config['n_init'], 5)  # Fewer initialization attempts
+    
     # Prepare features
     X_scaled = prepare_hmm_features(data, config)
-    features_used = ['log_return', 'volume', 'volatility_5', 'rsi', 'macd']
+    features_used = config['hmm_analysis']['features'][f'{pipeline_mode}_mode']
     logger.info(f"Prepared {len(features_used)} features for HMM: {features_used}")
     
     # Ensure data is 2D array (n_samples, n_features)
@@ -109,9 +126,9 @@ def train_hmm(data: pd.DataFrame, config: dict) -> Dict[str, Any]:
         raise ValueError(f"Expected 2D array, got shape {X_scaled.shape}")
     
     # Training parameters
-    n_states = config['n_hidden_states']
-    covariance_type = config['covariance_type']
-    n_attempts = 3
+    n_states = hmm_config['n_hidden_states']
+    covariance_type = hmm_config['covariance_type']
+    n_attempts = hmm_config['n_init']
     
     best_score = float('-inf')
     best_model = None
@@ -279,13 +296,13 @@ def run_hmm_analysis(df: pd.DataFrame) -> pd.DataFrame:
     result = df.copy()
     config = get_config()
     
-    if not config.hmm_analysis.get('enabled', False):
+    if not config['hmm_analysis']['enabled']:
         logger.info("HMM analysis disabled in config")
         return result
     
     try:
         # Train HMM model
-        hmm_results = train_hmm(result, config.hmm_analysis)
+        hmm_results = train_hmm(result, config)
         
         # Add state sequence to DataFrame
         result['hmm_regime'] = hmm_results['state_sequence']
@@ -293,12 +310,13 @@ def run_hmm_analysis(df: pd.DataFrame) -> pd.DataFrame:
             max(probs) for probs in hmm_results['state_probabilities']
         ]
         
-        # Add regime characteristics
-        regime_chars = {
-            i: '_'.join(info['characteristics'])
-            for i, (state, info) in enumerate(hmm_results['states'].items())
-        }
-        result['hmm_regime_char'] = result['hmm_regime'].map(regime_chars)
+        # Add regime characteristics if in full_analysis mode
+        if config.get('pipeline_mode') == 'full_analysis':
+            regime_chars = {
+                i: '_'.join(info['characteristics'])
+                for i, (state, info) in enumerate(hmm_results['states'].items())
+            }
+            result['hmm_regime_char'] = result['hmm_regime'].map(regime_chars)
         
         logger.info("HMM regime detection completed successfully")
         return result
