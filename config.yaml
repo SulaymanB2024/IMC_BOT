@@ -1,3 +1,64 @@
+# Pipeline Execution Mode
+pipeline_mode: 'full_analysis'  # Options: 'trading', 'full_analysis'
+# 'trading': Run only core features needed for bot operation
+# 'full_analysis': Run complete analysis including statistical tests and LLM insights
+
+# Feature Engineering Configuration
+feature_engineering:
+  technical_indicators:
+    enabled: true
+    # Core indicators (always calculated in trading mode)
+    core_indicators:
+      sma:
+        enabled: true
+        windows: [5, 10]  # Short windows for trading
+      ema:
+        enabled: true
+        windows: [5, 10]  # Short windows for trading
+      rsi:
+        enabled: true
+        period: 14
+      volatility:
+        enabled: true
+        windows: [5, 10]  # Short-term volatility
+    
+    # Extended indicators (optional for trading mode)
+    extended_indicators:
+      enabled: true  # Master switch for all extended indicators
+      bollinger_bands:
+        enabled: true
+        window: 20
+        num_std: 2
+      macd:
+        enabled: true
+        fast_period: 12
+        slow_period: 26
+        signal_period: 9
+      adx:
+        enabled: false  # Disabled by default in trading mode
+        period: 14
+      stochastic:
+        enabled: false  # Disabled by default in trading mode
+        k_period: 14
+        d_period: 3
+  
+  # Feature groups configuration
+  feature_groups:
+    lagged_features:
+      enabled: true
+      max_lags: 3  # Reduced from 5 for trading mode
+    rolling_statistics:
+      enabled: true
+      windows: [5, 10]  # Shorter windows for trading
+      metrics: ['mean', 'std']  # Basic metrics only
+    interaction_features:
+      enabled: false  # Disabled by default in trading mode
+      pairs: [['price', 'volume']]
+    long_term_features:
+      enabled: false  # Disabled by default in trading mode
+      windows: [50, 100]
+      metrics: ['mean', 'std', 'skew', 'kurt']
+
 # Data Sources
 input:
   data_dir: "data"
