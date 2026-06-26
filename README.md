@@ -2,6 +2,10 @@
 
 A robust data analysis pipeline for generating high-quality features for the IMC trading bot (givenProgram.py).
 
+## Related Public Research
+
+- Markets and modeling context: [sulayman-bowles.dev/markets](https://sulayman-bowles.dev/markets)
+
 ## Overview
 
 This pipeline processes trading data to generate a comprehensive set of technical indicators, volatility measures, and anomaly flags. The processed data is saved in a format ready to be consumed by the trading bot.
